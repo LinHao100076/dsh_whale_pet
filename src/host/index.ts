@@ -1,0 +1,1578 @@
+/**
+ * dsh-pet-desktop 宿主半侧（host half）—— 宠物插件的"后端"部分
+ *
+ * 职责：提供 `/dsh-pet-desktop-7340/` 前缀的**业务能力**（handlePetRoute 纯函数，路由与桌面管道共用）。
+ * 全部配置（内置默认 + 用户主配置 + 文件宠物）由 ./config 的 readAllConfig 统一读取合并，
+ * 本文件只消费它的返回值（绝对正确、零校验），不再接触任何配置文件。
+ *
+ * 两个入口消费同一份 handlePetRoute：
+ *   - HTTP 路由：注册在 DSH WebServer 上（浏览器 overlay / 设置页 / 斜杠命令用）
+ *   - 桌面 Helper 管道：helper-process.ts 的 bridgeHandler（DSH_PET_DESKTOP_BRIDGE=1 时经
+ *     dsh-pet-desktop-bridge:// scheme + stdout JSON 行 + 本地回调，**不走 HTTP**——
+ *     DSH Desktop 2.0.3+ 的浏览器访问闸门会拦插件子进程的裸 HTTP 请求）
+ * 两端行为严格一致（硬契约：浏览器/桌面功能/文案/配置完全对齐）。
+ *
+ * 路由：
+ *   /dsh-pet-desktop-7340/config             → 合并后的**成品配置**（{ main:{...}, test1:{...}, ... }，
+ *                                每条目字段已填满；浏览器/桌面/设置页的唯一配置入口）
+ *                                GET 读取成品；PUT 保存用户层（白名单重建 main-config.jsonc）、
+ *                                POST 同步用户层（把内置默认 config.jsonc **原文**整份写入，
+ *                                含注释与全部高级字段；合并结果与「没有用户层」等价）——
+ *                                两个写接口的**响应体都是保存后的成品聚合**，设置页即时生效
+ *                                直接拍平这份响应，客户端不再有第二份"补吹条目级字段"的实现
+ *   /dsh-pet-desktop-7340/reload              → 桌面端「重载配置」（右键菜单，POST）：重启桌面 Helper，全部桌面
+ *                                宠物窗口按最新配置重建（改配置文件后不必回设置页点保存）；与保存走
+ *                                **同一条**重启路径（syncDesktop），宠物数量/display/size 变化同样生效
+ *   /dsh-pet-desktop-7340/config/meta         → 配置文件与素材目录路径 + 全部存储位置清单
+ *                                       （设置页「高级配置」「卸载与存储」展示用）
+ *   /dsh-pet-desktop-7340/thumb/<素材根>/<动画名>.webm|.mov  → 素材按宠物归属（.mov 为 macOS 定制，扩展名取决于
+ *       客户端播放常量 ANIMATION_EXT；本路由固定双扩展名兜底）：
+ *       文件宠物 = $DSH_HOME/dsh-pet-desktop/pet/<素材根>-animation/（只查自己的，绝不回落）；
+ *       主宠物   = $DSH_HOME/dsh-pet-desktop/main-animation/<webm|mov>（用户目录，优先）→ 包内 assets/<webm|mov>
+ *       <素材根> 是**标识符**（pet/ 下文件名前缀），含分隔符/保留字符即 400（见 ID_FORBIDDEN）
+ *   /dsh-pet-desktop-7340/whisper|whisper/trigger → 碎碎念周期/手动生成（按宠物独立，人设读成品）
+ *   /dsh-pet-desktop-7340/chat                → 对话与记忆（GET 最近窗口 / POST 对话并写 memory.json）
+ *   /dsh-pet-desktop-7340/broadcast            → /chat 命令触发的气泡广播（两端 1s 轻轮询）
+ *   /dsh-pet-desktop-7340/balance|balance/trigger → 余额查询 / 手动触发计数（/balance 命令 +1）
+ *   /dsh-pet-desktop-7340/notify              → 系统通知帧（host 监听 DSH 宿主事件生成，浏览器增量轮询）
+ *   /dsh-pet-desktop-7340/font|pic             → 字体 / 通知图标素材
+ *
+ * 系统通知不属于宠物行为、不在这里的旧实现是：浏览器半侧 notify.ts 经 connection 事件流
+ * （api.events.mux/host）监听 DSH 事件。但 DSH 0.1.5 已删除该事件流 API——通知改为
+ * host 侧监听宿主事件（session/event + agent/error）生成帧入队，浏览器轮询
+ * /dsh-pet-desktop-7340/notify 拉取（见下方 notify 队列与监听；帧契约与 shared/notify.ts 一致）。
+ *
+ * 桌面模式（Electron 透明窗）没有独立配置文件：宠物显示在哪全部由宠物条目的 display 决定
+ * （web=仅浏览器 / desktop=仅桌面 / both=两者 / none=都不显示；缺失时合并器填内置默认值）。
+ *
+ * 安全性：resolveAsset 做"防穿越"校验，保证路径仍在对应根目录内；
+ *         PUT 保存经 saveUserConfig 白名单重建，id 过滤文件名非法字符。
+ *
+ * TODO(类型)：peer 依赖类型包本地暂不可解析，ctx/req/res 暂用 any；
+ *             依赖可解析后替换为 DSH 官方类型。
+ */
+import { createReadStream, existsSync, fstatSync } from 'node:fs';
+import { readFile, mkdir, writeFile } from 'node:fs/promises';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import { homedir } from 'node:os';
+import { join, normalize, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { resolveDshHome } from '@deepseek-ai/dsh-home-paths';
+import { credentialRef } from '@deepseek-ai/dsh-credentials';
+import { queryBalance } from './balance';
+import { generateWhisper } from './whisper';
+import { decideImageUse, generatePeek, type PeekImage, type PeekIntel, type PeekPomodoro } from './peek';
+import { generateChat, type ChatMemoryMessage } from './chat';
+import { pickMeme, readMemePool } from './memes';
+import {
+  findPetInstance,
+  flattenPetList,
+  ID_FORBIDDEN,
+  migrateUserConfig,
+  readAllConfig,
+  readUserConfig,
+  saveUserConfig,
+  syncUserConfigFromDefault,
+  userConfigUnparsable,
+  type ConfigPaths,
+} from './config';
+import {
+  GOAL_UPDATE_TOOL,
+  reduceWorkStatus,
+  currentTaskFromTodo,
+  goalUpdateAction,
+  WorkStatusStore,
+  type WorkStatusTurnContext,
+} from './work-status';
+import { agentErrorFrame, reduceNotifyFrame, type HostNotifyFrame } from './notify-events';
+import { profileNameFrom, storageEntries } from './storage-paths';
+import { mutateProductivitySnapshot, reconcileProductivitySnapshot } from './productivity-store';
+import { CueStore, DEFAULT_SFX_FILE, isSoundFileName, resolveSoundFile, sfxState, soundMime } from './sfx';
+import {
+  HelperProcess,
+  defaultElectronExe,
+  electronLandingDir,
+  ensureElectronDownload,
+  hasGraphicalDisplay,
+  resolveElectronPath,
+} from './helper-process';
+
+/** 插件行 id（与 cordis.patch.yml 一致） */
+export const name = 'pet';
+/** 需要注入的服务：webServer（路由）+ agentDefaultModel（当前服务商）+ credentials（凭证）+ llm（对话模型调用）+ commands（/balance 斜杠命令） */
+export const inject = ['webServer', 'agentDefaultModel', 'credentials', 'llm', 'commands'];
+
+/** 本包目录：宿主构建产物位于 lib/，其上一级即包根。 */
+const PACKAGE_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
+
+/** 包内 assets 根（表情包池解析用：assets/memes/<名称>.png） */
+const PACKAGE_ROOT_ASSETS = join(PACKAGE_ROOT, 'assets');
+
+/** 路由前缀 */
+const ROUTE_PREFIX = '/dsh-pet-desktop-7340';
+
+/** 不同扩展名对应的 Content-Type 映射 */
+const MIME: Record<string, string> = {
+  '.webm': 'video/webm',
+  '.mov': 'video/quicktime',
+  '.mp4': 'video/mp4',
+  '.png': 'image/png',
+  '.json': 'application/json; charset=utf-8',
+  '.jsonc': 'application/json; charset=utf-8',
+  '.ttf': 'font/ttf',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+};
+
+/**
+ * 规范化并校验请求路径，确保它在 assets 根目录内（防路径穿越）。
+ * @returns 规范化后的绝对文件路径；非法（穿越）时返回 undefined
+ */
+function resolveAsset(root: string, rel: string): string | undefined {
+  if (rel.length === 0) return undefined;
+  const candidate = normalize(join(root, rel));
+  const rootWithSep = root.endsWith(sep) ? root : root + sep;
+  if (candidate !== root && !candidate.startsWith(rootWithSep)) return undefined;
+  return candidate;
+}
+
+/** 在 root 下解析并确认实体存在；非法（穿越）或不存在时返回 undefined */
+function resolveExisting(root: string, rel: string): string | undefined {
+  const candidate = resolveAsset(root, rel);
+  return candidate && existsSync(candidate) ? candidate : undefined;
+}
+
+/**
+ * 流式返回一个文件（带 Content-Type / 长度 / 缓存头）。
+ *
+ * Content-Length 必须取自**正在读的那个 fd**（open 事件里 fstat），不能先 stat 再另开流：用户往
+ * $DSH_HOME/dsh-pet-desktop/main-animation/webm/ 复制或同名覆盖素材时，stat 与真正开始读之间文件会被截断/
+ * 改写，一旦实际字节数少于声明的长度，这个响应就**永远不结束、也不报错**（浏览器表现为 stalled、
+ * 视频 loadeddata 永不触发且无 error）——正是 issue #62 现场"数据断供"的一种成因。同一个 fd 的
+ * fstat 拿到的大小与随后读出的字节天然一致。
+ */
+function sendFile(res: ServerResponse, file: string, contentType: string): void {
+  const stream = createReadStream(file);
+  stream.once('open', (fd) => {
+    if (res.destroyed || res.writableEnded) {
+      stream.destroy(); // 客户端在开流前就放弃了
+      return;
+    }
+    try {
+      res.writeHead(200, {
+        'content-type': contentType,
+        'content-length': fstatSync(fd).size,
+        'cache-control': 'public, max-age=3600',
+      });
+    } catch {
+      // 极端情况下 fstat 拿不到：不发长度头，交给 Node 用 chunked 收尾（长度天然一致，只是没声明）
+      res.writeHead(200, { 'content-type': contentType, 'cache-control': 'public, max-age=3600' });
+    }
+    stream.pipe(res);
+  });
+  // 读失败（文件被删/权限/被占用）：直接断连，让客户端立刻看到失败，而不是无限等待
+  stream.on('error', () => res.destroy());
+  // 客户端提前断开（快速切动画时高频发生）→ 停读，别把整个文件读完
+  res.on('close', () => stream.destroy());
+}
+
+// 配置的读取/校验/合并/保存全部收敛在 ./config（readAllConfig / saveUserConfig，host 自包含实现，
+// 不 import src/shared —— DSH 单文件加载约束）。本文件不再保留任何配置逻辑，只消费成品返回值。
+
+/** 该宠物是否参与桌面模式（Electron 透明窗） */
+const isDesktopVisible = (display: unknown): boolean => display === 'desktop' || display === 'both';
+
+/** 发送 JSON 响应（headers 可选：如 no-cache 触发计数） */
+function sendJson(res: ServerResponse, status: number, obj: unknown, headers: Record<string, string> = {}): void {
+  const body = JSON.stringify(obj);
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(body),
+    ...headers,
+  });
+  res.end(body);
+}
+
+/** 发送纯文本响应（素材 404/400 等显式错误文案） */
+function sendText(res: ServerResponse, status: number, body: string): void {
+  res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8' });
+  res.end(body);
+}
+
+/** 单次业务路由的应答（WebServer 注册与桌面 Helper 管道共用的同一契约；消费方各自落盘） */
+type RouteResult =
+  | { kind: 'json'; status: number; obj: unknown; headers?: Record<string, string> }
+  | { kind: 'text'; status: number; body: string }
+  | { kind: 'file'; file: string; contentType: string };
+
+/** 收集请求体（文本） */
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve2, reject) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (c: Buffer) => chunks.push(c));
+    req.on('end', () => resolve2(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 额外宠物（pet pack）说明：校验/扫描已收敛到 ./config（readAllConfig 内部逐字段合并），
+// 这里不再有 host 侧拷贝——文件宠物与主宠物一样，统一从 readAllConfig 的成品读取。
+// ---------------------------------------------------------------------------
+
+/** 宿主插件主体：注册 `/dsh-pet-desktop-7340` 前缀路由 + 斜杠命令（/balance /pet /chat）。 */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- DSH 注入的 ctx（webServer/locale 等 service 无静态类型）
+export function apply(ctx: any): void {
+  // 用户数据根：配置与用户素材统一收敛于此（扩展包按 <插件id> 各自建目录）
+  const dshHome = resolveDshHome();
+  const userRoot = join(dshHome, 'dsh-pet-desktop');
+  let productivityDeadline: ReturnType<typeof setTimeout> | undefined;
+  let productivityGeneration = 0;
+  const scheduleProductivityDeadline = (snapshot: Awaited<ReturnType<typeof reconcileProductivitySnapshot>>) => {
+    if (productivityDeadline !== undefined) clearTimeout(productivityDeadline);
+    productivityDeadline = undefined;
+    const generation = ++productivityGeneration;
+    const state = snapshot.pomodoro.state;
+    if (!state.running || state.endsAt === null) return;
+    const delay = Math.max(0, state.endsAt - Date.now());
+    productivityDeadline = setTimeout(
+      () => {
+        if (generation !== productivityGeneration) return;
+        productivityDeadline = undefined;
+        void reconcileProductivitySnapshot(userRoot)
+          .then((next) => {
+            if (generation === productivityGeneration) scheduleProductivityDeadline(next);
+          })
+          .catch((error) => console.error('[dsh-pet-desktop] 番茄钟到期状态保存失败', error));
+      },
+      Math.min(delay, 2_147_000_000),
+    );
+  };
+  ctx.effect(() => {
+    let active = true;
+    void reconcileProductivitySnapshot(userRoot)
+      .then((snapshot) => {
+        if (active) scheduleProductivityDeadline(snapshot);
+      })
+      .catch((error) => console.error('[dsh-pet-desktop] 番茄钟状态恢复失败', error));
+    return () => {
+      active = false;
+      productivityGeneration += 1;
+      if (productivityDeadline !== undefined) clearTimeout(productivityDeadline);
+      productivityDeadline = undefined;
+    };
+  }, 'dsh-pet-desktop: productivity timer');
+  // 用户主配置（可编辑层）与文件宠物目录；配置读取/合并统一走 readAllConfig（./config）。
+  // 主配置是 **JSONC**（main-config.jsonc）——与包内默认 config.jsonc 同名同格式：
+  // 「同步」写进去的就是带注释的原文，扩展名如实反映内容（旧版 main-config.json 只读回落 + 启动迁移）
+  const userConfigPath = join(userRoot, 'main-config.jsonc');
+  const legacyUserConfigPath = join(userRoot, 'main-config.json');
+  const petConfigDir = join(userRoot, 'pet');
+  // 配置路径集（readAllConfig 的唯一输入：内置默认 + 用户主配置 + 文件宠物目录）
+  const configPaths: ConfigPaths = {
+    defaultFile: join(PACKAGE_ROOT, 'assets', 'config.jsonc'),
+    userFile: userConfigPath,
+    legacyUserFile: legacyUserConfigPath,
+    petDir: petConfigDir,
+  };
+  // 老用户一次性迁移：main-config.json → main-config.jsonc（重命名，内容一字不动；
+  // 新文件已存在则不动旧文件）。失败不影响运行——读取侧对旧路径有回落。
+  migrateUserConfig(configPaths, (msg) => console.log('[dsh-pet-desktop] ' + msg));
+  // 用户动画目录（thumb 播放时优先于包内素材；webm 放 main-animation/webm/，mov（macOS 定制）放 main-animation/mov/）
+  const thumbUserRoot = join(userRoot, 'main-animation');
+  // 手动触发计数：/balance 命令 +1，两边（浏览器/桌面）同样的 1s 轮询检测变化后刷新余额（进程内内存态，重启归零）
+  let balanceTriggerCount = 0;
+  // 工作状态联动快照（/work-status 端点响应，浏览器 1s 轮询）：state=当前活动状态（null=空闲）、
+  // task=当前任务详情、ts=最近变化时间（轮询侧检测变化用）。气泡文案不在此：浏览器读配置
+  // events.workStatusTexts（host 不内置文案）。
+  // 聚合与展示选择都在 WorkStatusStore（host/work-status.ts，纯逻辑可单测）：**state 与 task 都按
+  // 会话存**——task 曾是全局单值，写过一次就跟着此后所有会话活动一直显示（issue #59）。
+  // 进程内内存态：重启回空闲；每次会话事件有实际状态变化才更新（签名比对防刷屏）。
+  const workStatus = new WorkStatusStore();
+  // 系统通知帧队列（/notify 端点增量拉取）：host 监听 DSH 宿主事件生成通知帧
+  // （帧契约与 shared/notify.ts 一致），浏览器 1s 轮询 /notify?since=<seq> 拉增量弹 toast。
+  // 背景：DSH 0.1.5 删除浏览器侧 api.events.mux/host 事件流，改为 host 转发通道——
+  // 不依赖 DSH 版本间变化的事件 API。进程内内存态：重启清空（通知本来就是瞬时提醒）。
+  const notifyFrames: Array<{ seq: number; frame: HostNotifyFrame }> = [];
+  let notifySeq = 0;
+  const NOTIFY_QUEUE_MAX = 100; // 上限防膨胀：超出丢最旧（1s 轮询正常不会积压）
+  const pushNotifyFrame = (frame: HostNotifyFrame): void => {
+    notifySeq += 1;
+    notifyFrames.push({ seq: notifySeq, frame });
+    if (notifyFrames.length > NOTIFY_QUEUE_MAX) notifyFrames.shift();
+  };
+  /** 每会话 turn 级标志（goal 续跑轮判定；不参与展示，仅修正 turn/end 终局语义） */
+  const turnFlags = new Map<string, WorkStatusTurnContext>();
+  /** 终态（success/error）展示窗口定时器：约 60s 后清掉该会话条目，陈旧完成态不再浮上来（Bug 2/3） */
+  const terminalTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const TERMINAL_KEEP_MS = 60 * 1000;
+  /** 取消某会话待执行的终态清理：会话已回到非终态，那次清理到点后既不清理也不重排，留着只会误导 */
+  const cancelTerminalCleanup = (sessionId: string): void => {
+    const t = terminalTimers.get(sessionId);
+    if (t === undefined) return;
+    clearTimeout(t);
+    terminalTimers.delete(sessionId);
+  };
+  /** 排一个终态清理定时器（每会话一个，已排则跳过） */
+  const scheduleTerminalCleanup = (sessionId: string): void => {
+    if (terminalTimers.has(sessionId)) return;
+    const t = setTimeout(() => {
+      terminalTimers.delete(sessionId);
+      const state = workStatus.stateOf(sessionId);
+      if (state === 'success' || state === 'error') {
+        workStatus.clear(sessionId); // 条目连同它的任务详情文案一起消失，不残留到后续活动
+        turnFlags.delete(sessionId);
+      }
+    }, TERMINAL_KEEP_MS);
+    terminalTimers.set(sessionId, t);
+  };
+  // 命令「当前桌宠」（/pet 选择、/chat 使用）：全局单值不分会话；进程内内存，重启回默认第一只
+  let activePetId = '';
+  // 命令触发的展示气泡缓存（/chat 命令写入；浏览器/桌面 1s 轮询 /broadcast 拉取，ts 变化即弹气泡）。
+  // 与碎碎念周期缓存（whisperCache）独立：手动触发语义不受 whisperEnabled 门控（进程内，重启清空）
+  const broadcastCache = new Map<string, { text: string; image?: string; ts: number }>();
+  // 碎碎念生成缓存（按宠物独立）：每只启用的宠物在自己的周期内返回同一句（ts 不变），
+  // 同宠物的多个端共享一句、避免重复 LLM 调用（进程内内存态，重启清空）。
+  // image = 该次生成配的表情包名称（未开配图则为 undefined）——与 text 同生命周期，
+  // 保证周期内多端看到的是"同一句话配同一张图"
+  const whisperCache = new Map<string, { text: string; image?: string; ts: number }>();
+  // 窥屏吐槽节流缓存（按宠物独立）：harness 侧的轮询周期就是情报采集周期，这里再兜一层——
+  // 同一宠物在 eventsRefreshSec.peek 内重复请求直接返回上一句，避免多端/异常重试把模型刷爆。
+  // 与 whisperCache 不同的是：窥屏**不做跨端复用语义**（各端看的是各自的屏幕），
+  // 这里的缓存纯粹是防重复调用（进程内内存态，重启清空）。
+  const peekCache = new Map<string, { text: string; image?: string; ts: number }>();
+  /** 「当前模型不支持图片」的告警去重（每宠物一次，避免每 10 分钟刷同一句） */
+  const peekImageWarned = new Set<string>();
+
+  // 对话记忆文件（唯一读写方 = 本进程；浏览器/桌面两端都只是客户端 → 同一实例天然共享同一份记忆）。
+  // 结构双层：{ <种类桶 assetRoot ?? petId>: { <实例 id>: { messages: ChatMemoryMessage[] } } }
+  const memoryPath = join(userRoot, 'memory.json');
+  // 对话写操作串行队列：read-modify-write 排队执行，防两端同时对话时交错写盘
+  let chatQueue: Promise<void> = Promise.resolve();
+
+  /** 读记忆文件：不存在 → 空；损坏 → 显式报错 + 备份原始文件（绝不静默丢数据）+ 重建空记忆 */
+  const readMemory = async (): Promise<Record<string, Record<string, { messages: ChatMemoryMessage[] }>>> => {
+    let raw: string;
+    try {
+      raw = await readFile(memoryPath, 'utf8');
+    } catch {
+      return {}; // 文件不存在 = 尚无记忆
+    }
+    try {
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      if (!parsed || typeof parsed !== 'object') throw new Error('not an object');
+      return parsed as Record<string, Record<string, { messages: ChatMemoryMessage[] }>>;
+    } catch (e) {
+      console.error(
+        `dsh-pet-desktop: 记忆文件损坏已备份（对话将从头开始）：${memoryPath}（${e instanceof Error ? e.message : String(e)}）`,
+      );
+      try {
+        await mkdir(userRoot, { recursive: true });
+        await writeFile(`${memoryPath}.bak-${Date.now()}`, raw, 'utf8');
+      } catch {
+        /* 备份失败仅告警，不阻断 */
+      }
+      return {};
+    }
+  };
+
+  const writeMemory = async (mem: Record<string, Record<string, { messages: ChatMemoryMessage[] }>>): Promise<void> => {
+    await mkdir(userRoot, { recursive: true });
+    await writeFile(memoryPath, JSON.stringify(mem, null, 2), 'utf8');
+  };
+
+  /** 把一次读写封进串行队列（同进程内防交错），返回 fn 的结果 */
+  const withMemoryLock = <T>(fn: () => Promise<T>): Promise<T> => {
+    const run = chatQueue.then(fn, fn);
+    chatQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  };
+
+  // ---- 配置消费：唯一入口 readAllConfig（./config）——返回值绝对正确，这里只读字段，零校验 ----
+
+  /** 某宠物的最终人设 system：所属条目（非文件宠物 → main 条目）的 whisperPrompt（合并器已填默认）
+   *  + 无条件追加一句名字声明（name，缺失已按 id）——碎碎念与对话共用同一拼装。 */
+  const petSystemPrompt = (petId: string, cfg: Record<string, Record<string, unknown>>): string => {
+    const found = findPetInstance(cfg, petId);
+    const conf = found ? found.conf : (cfg.main ?? {});
+    const prompt = typeof conf.whisperPrompt === 'string' ? conf.whisperPrompt : '';
+    const name = found ? String(found.pet.name || found.pet.id || petId) : petId;
+    const nameLine = '你的名字是“' + name + '”。';
+    return prompt ? prompt + '\n' + nameLine : nameLine;
+  };
+
+  /** 对话记忆轮数（1 轮 = 1 问 1 答）：所属条目/主条目的 chatMemoryRounds（合并器已填默认非负数字） */
+  const memoryRounds = (petId: string, cfg: Record<string, Record<string, unknown>>): number => {
+    const found = findPetInstance(cfg, petId);
+    const v = Number(found?.conf.chatMemoryRounds ?? cfg.main?.chatMemoryRounds);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 5;
+  };
+
+  /** 生成/返回某宠物的一句碎碎念（周期 GET 与菜单手动触发共用的同一逻辑）：
+   *  每只宠物独立生成（所属条目的人设），缓存按 pet 分开；
+   *  force=false 走周期节流（缓存期内返回同一句 ts），force=true 强制新生成并刷新缓存
+   *  （右键菜单「碎碎念」手动触发：绕过节流立即新出一句，同宠多端下次轮询看到新 ts 一起展示）。
+   *  配图（whisperImageEnabled 开启时）：从表情包池**随机抽 1 张**，把描述注入指令并随文本带回；
+   *  连图带句一起进缓存——周期内多端轮询看到的是同一张图（同 ts 同图，语义与文本一致）。 */
+  const serveWhisper = async (
+    petId: string,
+    force: boolean,
+  ): Promise<{ ok: boolean; text?: string; image?: string; ts?: number; reason?: string; message?: string }> => {
+    const cfg = readAllConfig(configPaths);
+    const found = findPetInstance(cfg, petId);
+    const conf = found ? found.conf : (cfg.main ?? {});
+    // 所属条目的碎碎念周期（合并器已填内置默认，必为正数秒）
+    const ers = conf.eventsRefreshSec as Record<string, unknown> | undefined;
+    const intervalSec = ers && typeof ers.whisper === 'number' ? ers.whisper : 3600;
+    const system = petSystemPrompt(petId, cfg);
+    const now = Date.now();
+    const cached = whisperCache.get(petId);
+    if (!force && cached && now - cached.ts < intervalSec * 1000) {
+      return { ok: true, text: cached.text, image: cached.image, ts: cached.ts };
+    }
+    // 配图：全局开关关闭 / 池为空 / 池内图片全缺失 → 纯文本（不报错，退化为原行为）
+    const meme =
+      conf.whisperImageEnabled === true ? pickMeme(readMemePool(conf.memes, PACKAGE_ROOT_ASSETS)) : undefined;
+    const result = await generateWhisper(ctx, system, meme);
+    if (!result.ok) {
+      return { ok: false, reason: result.reason, message: result.message };
+    }
+    whisperCache.set(petId, { text: result.text, image: result.image, ts: now });
+    return { ok: true, text: result.text, image: result.image, ts: now };
+  };
+
+  /** 读番茄钟情报（窥屏用）：直接读 productivity 存储，与「番茄钟与 Todo」面板同一个事实来源。
+   *  读取失败 / 存储还没建立 → null：窥屏退回"只看窗口"，绝不因为番茄钟读不到而整次失败。 */
+  const readPomodoroIntel = async (): Promise<PeekPomodoro | null> => {
+    try {
+      const snap = await reconcileProductivitySnapshot(userRoot);
+      const st = snap.pomodoro.state;
+      const todo = st.todoId ? snap.todos.find((t) => t.id === st.todoId) : undefined;
+      const remaining =
+        st.running && st.endsAt !== null
+          ? Math.max(0, Math.ceil((st.endsAt - Date.now()) / 1000))
+          : st.remainingSeconds;
+      return {
+        phase: st.phase,
+        running: st.running,
+        remainingSeconds: remaining,
+        ...(todo ? { taskTitle: todo.title } : {}),
+        completedFocusCycles: st.completedFocusCycles,
+      };
+    } catch {
+      return null;
+    }
+  };
+
+  /** 当前模型声明的输入模态（undefined = 元数据未知）。查询失败一律当"未知"，
+   *  交给 decideImageUse 决定是"先试一次"还是"直接跳过"——绝不在这里臆断能力。 */
+  const peekInputModalities = async (): Promise<readonly string[] | undefined> => {
+    try {
+      const sel = ctx.agentDefaultModel?.currentSelection?.();
+      if (!sel?.provider || !sel?.model) return undefined;
+      const llm = ctx.llm as
+        { resolveModelInfo?(p: string, m: string): Promise<{ inputModalities?: readonly string[] }> } | undefined;
+      if (!llm || typeof llm.resolveModelInfo !== 'function') return undefined;
+      const info = await llm.resolveModelInfo(sel.provider, sel.model);
+      return info?.inputModalities;
+    } catch {
+      return undefined;
+    }
+  };
+
+  /**
+   * 窥屏吐槽：把发起端（桌面 helper）取到的**前台窗口情报**（+可选截图）交给模型，生成一句吐槽。
+   *
+   * 与碎碎念的三点不同：
+   *   ① 情报由发起端提供（只有 helper 能问 Windows），所以走 POST 而不是 GET 轮询；
+   *   ② 缓存只在 host 侧按周期节流去重（同一宠物周期内重复请求直接返回上一句），不做跨端共享
+   *      ——各端看的是各自的屏幕，复用别人的"看到的内容"没有意义；
+   *   ③ 番茄钟情报由 host 自己读 productivity 存储（与面板同一个事实来源），不依赖客户端上报。
+   *
+   * 截图：peekScreenEnabled 且模型声明支持图片时才真的发；模型显式不支持则跳过（不发也不报错）；
+   * 元数据未知则先试一次、失败自动退回纯情报（generatePeek 内部处理）。附件服务缺失同样退回纯情报。
+   */
+  const servePeek = async (
+    petId: string,
+    rawContext: unknown,
+    rawImage: unknown,
+    force: boolean,
+  ): Promise<{
+    ok: boolean;
+    text?: string;
+    image?: string;
+    ts?: number;
+    withImage?: boolean;
+    imageDropped?: boolean;
+    reason?: string;
+    message?: string;
+  }> => {
+    const cfg = readAllConfig(configPaths);
+    const found = findPetInstance(cfg, petId);
+    const conf = found ? found.conf : (cfg.main ?? {});
+    const ers = conf.eventsRefreshSec as Record<string, unknown> | undefined;
+    const intervalSec = ers && typeof ers.peek === 'number' ? ers.peek : 600;
+    const now = Date.now();
+    const cached = peekCache.get(petId);
+    if (!force && cached && now - cached.ts < intervalSec * 1000) {
+      return { ok: true, text: cached.text, image: cached.image, ts: cached.ts };
+    }
+
+    // 情报：只接受字符串/数字这类标量，长度截断（防把整篇窗口标题/超长文本灌进提示词）
+    const c = rawContext && typeof rawContext === 'object' ? (rawContext as Record<string, unknown>) : {};
+    const clip = (v: unknown, max: number): string | undefined =>
+      typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : undefined;
+    const intel: PeekIntel = {
+      context: {
+        windowTitle: clip(c.windowTitle, 200),
+        processName: clip(c.processName, 80),
+        idleSeconds: Number.isFinite(Number(c.idleSeconds)) ? Number(c.idleSeconds) : undefined,
+      },
+      pomodoro: conf.peekPomodoroEnabled === true ? await readPomodoroIntel() : null,
+    };
+
+    // 人设：所属条目的 peekPrompt（合并器已填默认）+ 名字声明（与碎碎念同一拼装手法）
+    const prompt = typeof conf.peekPrompt === 'string' ? conf.peekPrompt : '';
+    const name = found ? String(found.pet.name || found.pet.id || petId) : petId;
+    const nameLine = '你的名字是“' + name + '”。';
+    const system = prompt ? prompt + '\n' + nameLine : nameLine;
+
+    // 截图：开关 + 模型能力两关都过才带
+    let image: PeekImage | null = null;
+    let imageSkipped: 'disabled' | 'model-text-only' | 'bad-payload' | null = null;
+    const shot = rawImage && typeof rawImage === 'object' ? (rawImage as Record<string, unknown>) : null;
+    const base64 = shot && typeof shot.base64 === 'string' ? shot.base64 : '';
+    if (conf.peekScreenEnabled !== true) {
+      imageSkipped = 'disabled';
+    } else if (!base64) {
+      imageSkipped = 'bad-payload';
+    } else {
+      const use = decideImageUse(await peekInputModalities());
+      if (use === 'skip') imageSkipped = 'model-text-only';
+      else image = { base64, mediaType: typeof shot?.mediaType === 'string' ? shot.mediaType : 'image/jpeg' };
+    }
+
+    // 配图（表情包）：与碎碎念同款——窥屏是"随口吐槽"，随机抽一张即可，不额外让模型选
+    const meme =
+      conf.whisperImageEnabled === true ? pickMeme(readMemePool(conf.memes, PACKAGE_ROOT_ASSETS)) : undefined;
+    const result = await generatePeek(ctx, system, intel, image);
+    if (!result.ok) {
+      return { ok: false, reason: result.reason, message: result.message };
+    }
+    const ts = Date.now();
+    // 模型不支持图片这件事只提示一次（每宠物一次），避免每 10 分钟刷同一句
+    if (imageSkipped === 'model-text-only' && !peekImageWarned.has(petId)) {
+      peekImageWarned.add(petId);
+      ctx.logger?.warn?.(
+        `[dsh-pet-desktop] 当前模型不支持图片输入，窥屏已退回"只看窗口标题"模式（宠物 ${petId}）；` +
+          '想用截图请换多模态模型，或把 peekScreenEnabled 设为 false 关掉这项。',
+      );
+    }
+    const out: { text: string; image?: string; withImage?: boolean; imageDropped?: boolean } = { text: result.text };
+    if (result.imageDropped) out.imageDropped = true;
+    else if (image) out.withImage = true;
+    if (meme) out.image = meme.name;
+    peekCache.set(petId, { text: out.text, image: out.image, ts });
+    return { ok: true, ...out, ts };
+  };
+
+  /** 与某只宠物对话：截取最近记忆 → 生成回复 → 写入记忆 → 返回 {reply,ts}。   *  供 /chat 端点（POST）与 /chat 命令共用同一条路径（锁内读写，防两端交错写盘）。
+   *  配图（chatImageEnabled 开启时）：把表情包清单交给模型按语境选一张，命中池内才随回复带回。 */
+  const chatWithPet = async (
+    petId: string,
+    text: string,
+  ): Promise<
+    | { ok: true; reply: string; image?: string; ts: number }
+    | { ok: false; reason: 'provider-missing' | 'generate-error'; message?: string }
+  > =>
+    withMemoryLock(async () => {
+      const cfg = readAllConfig(configPaths);
+      const rounds = memoryRounds(petId, cfg);
+      const conf = (findPetInstance(cfg, petId) ?? { conf: cfg.main ?? {} }).conf;
+      // 人设：所属条目的 whisperPrompt（合并器已填默认）+ 名字声明（与碎碎念同一拼装）
+      const system = petSystemPrompt(petId, cfg);
+      // 配图：开关关闭 → 空池（指令与解析都不介入，与旧行为逐字一致）
+      const pool = conf.chatImageEnabled === true ? readMemePool(conf.memes, PACKAGE_ROOT_ASSETS) : [];
+      const mem = await readMemory();
+      const bucketKey = findPetInstance(cfg, petId)?.entry ?? petId;
+      const bucket = (mem[bucketKey] ??= {});
+      const entry = (bucket[petId] ??= { messages: [] });
+      const list = entry.messages.slice().slice(-rounds * 2);
+      const generated = await generateChat(ctx, system, list, text, pool);
+      if (!generated.ok) return generated;
+      const now = Date.now();
+      entry.messages.push({ role: 'user', content: text, ts: now });
+      // 记忆只存正文（配图属展示层，不进上下文——否则下次请求会把标记当历史读回去）
+      entry.messages.push({ role: 'assistant', content: generated.text, ts: now });
+      await writeMemory(mem);
+      return generated.image
+        ? { ok: true as const, reply: generated.text, image: generated.image, ts: now }
+        : { ok: true as const, reply: generated.text, ts: now };
+    });
+
+  /**
+   * 当前生效宠物列表 = readAllConfig 成品拍平（main + 文件宠物全部条目；合并器已保证 id 唯一、
+   * 字段填满），命令与桌面模式都从这里取。
+   */
+  const effectivePetList = (): Record<string, unknown>[] => flattenPetList(readAllConfig(configPaths));
+
+  /** 命令触发的展示气泡：/chat 命令写入（两端 1s 轮询 /broadcast 拉取展示）；覆盖手动触发场景。
+   *  image：配图名称（碎碎念/对话配图开关开启时由 host 抽定或模型选定），随文本一起进缓存——
+   *  与 /whisper 的 serveWhisper 契约对齐，否则命令这条路会把图丢掉（只剩文字气泡）。 */
+  const broadcastTo = (petId: string, text: string, image?: string): void => {
+    broadcastCache.set(petId, { text, image, ts: Date.now() });
+  };
+
+  /** 当前交互桌宠 id：/pet 已选且仍存在 → 该宠物；未选/已失效 → 有效宠物列表第一只（进程内，重启回默认） */
+  const resolveActivePetId = (): string => {
+    try {
+      const eff = effectivePetList();
+      if (eff.length === 0) return '';
+      if (activePetId && eff.some((p) => String(p.id) === activePetId)) return activePetId;
+      return String(eff[0].id);
+    } catch {
+      return activePetId;
+    }
+  };
+
+  /** 宠物的显示名（name，缺失回落 id）——命令文案用 */
+  const petDisplayName = (pet: Record<string, unknown>): string => {
+    const n = String(pet.name ?? '').trim();
+    return n || String(pet.id ?? '');
+  };
+
+  let hasDesktopPet = false;
+  const refreshDesktop = (): void => {
+    hasDesktopPet = false;
+    try {
+      hasDesktopPet = effectivePetList().some((p) => isDesktopVisible(p.display));
+    } catch (e) {
+      ctx.logger?.warn?.(
+        `[dsh-pet-desktop] 宠物配置非法，桌面模式已跳过：${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  };
+  refreshDesktop();
+
+  /** 桌面可见宠物列表（[{id,size}]）：透传 Helper 决定创建几个局部窗口（每宠物一个）。 */
+  const desktopPetList = (): Array<{ id: string; size: number }> => {
+    try {
+      return effectivePetList()
+        .filter((p) => isDesktopVisible(p.display))
+        .map((p) => ({ id: String(p.id), size: Number(p.size) }));
+    } catch {
+      return [];
+    }
+  };
+
+  /** 「有应用全屏时隐藏桌宠」开关（成品 main 条目的顶层字段）：读配置失败一律按关闭处理——
+   *  宁可一直显示，也不因为一次读取异常把桌宠藏起来。改动随 helper 重建生效（保存配置会重启 helper）。 */
+  const hideOnFullscreen = (): boolean => {
+    try {
+      return readAllConfig(configPaths).main?.hideOnFullscreen === true;
+    } catch {
+      return false;
+    }
+  };
+
+  /** 「窥屏吐槽」开关：任意一只桌面可见宠物开了窥屏（pets[].peekEnabled）就为 '1'——
+   *  窗口情报/截图能力由 helper 提供，渲染端按宠物自己的开关决定要不要用。
+   *  读配置失败一律按关闭处理（宁可什么都不看，也不因为一次读取异常去偷看屏幕）。 */
+  const peekEnabled = (): boolean => {
+    try {
+      return flattenPetList(readAllConfig(configPaths)).some((p) => p.peekEnabled === true);
+    } catch {
+      return false;
+    }
+  };
+
+  // ---- 「需要你做决定」提醒音 ----
+  // 全局认领式队列：多宠物窗口 + 浏览器 overlay 同时在线时，只有先认领的那个客户端播一次。
+  const sfxCues = new CueStore();
+
+  /** 读提醒音的三个配置项（成品 main 条目）：开关 / 音量 / 文件名。
+   *  读配置失败一律按**关闭**处理——宁可少响一声，也不因为一次读取异常半夜突然响。 */
+  const sfxSetting = (): { enabled: boolean; volume: unknown; file: string } => {
+    try {
+      const main = readAllConfig(configPaths).main ?? {};
+      const file =
+        typeof main.sfxDecision === 'string' && main.sfxDecision.trim() ? main.sfxDecision.trim() : DEFAULT_SFX_FILE;
+      return { enabled: main.sfxEnabled === true, volume: main.sfxVolume, file };
+    } catch {
+      return { enabled: false, volume: 0.8, file: DEFAULT_SFX_FILE };
+    }
+  };
+
+  /** 组装 GET /sfx 的响应（文件解析 + 队列一起算） */
+  const readSfxState = (): ReturnType<typeof sfxState> => {
+    const setting = sfxSetting();
+    const file = resolveSoundFile({ userRoot, packageRoot: PACKAGE_ROOT }, setting.file);
+    return sfxState({
+      enabled: setting.enabled,
+      volume: setting.volume,
+      file: setting.file,
+      // 音频地址给**去掉路由前缀**的路径（'/sound/<file>'）：两端各自接到自己的基址上
+      // （桌面走 bridge scheme 的 BASE，浏览器走同源 '/dsh-pet-desktop-7340'）——与表情包图片同一约定。
+      // 名字要过白名单校验，否则配置里的怪名字会被拼进 URL。
+      url: file !== undefined && isSoundFileName(setting.file) ? `/sound/${encodeURIComponent(setting.file)}` : null,
+      hasFile: file !== undefined,
+      pending: sfxCues.pending(),
+    });
+  };
+
+  let helper: HelperProcess | undefined;
+  let startRetryTimer: NodeJS.Timeout | undefined;
+  let electronEnsure: Promise<void> | undefined;
+  let disposed = false;
+  /** 「无图形环境」提示只在进程生命周期内打一次，避免守护循环刷屏 */
+  let displayWarned = false;
+
+  /** 用已确认存在的 Electron 路径拉起桌面 Helper（每只桌面宠物一个局部小窗口）。 */
+  const launchHelper = (electronPath: string | undefined): void => {
+    if (helper || disposed) return;
+    if (!hasDesktopPet) return; // 无宠物显示在桌面（display 含 desktop/both）：不启动
+    const port = typeof ctx.webServer?.port === 'number' ? ctx.webServer.port : 0;
+    if (!port || port <= 0) {
+      // webServer 可能尚未完成监听（OS 分配端口时 port 短暂为 0）：延迟重试。
+      if (!startRetryTimer) {
+        startRetryTimer = setTimeout(() => {
+          startRetryTimer = undefined;
+          launchHelper(electronPath);
+        }, 500);
+        startRetryTimer.unref?.();
+      }
+      return;
+    }
+    const origin = `http://127.0.0.1:${port}`;
+    // 桌面渲染端也从同一份 handlePetRoute 拿成品配置（每只宠物一个局部小窗口；经管道，不走 HTTP——
+    // DSH Desktop 2.0.3+ 会拦插件自拉进程的裸 HTTP 请求，浏览器访问闸门只放行带令牌的请求）
+    const configUrl = `${origin}${ROUTE_PREFIX}/config`;
+    helper = new HelperProcess(
+      {
+        electronPath,
+        env: {
+          DSH_PET_DESKTOP_CONFIG_URL: configUrl,
+          DSH_PET_DESKTOP_SCALE: '1',
+          // 打开 bridge 协议：main.js 注册 dsh-pet-desktop-bridge scheme，把渲染端请求经管道转给宿主
+          DSH_PET_DESKTOP_BRIDGE: '1',
+          // 每只桌面宠物一个局部小窗口：透传宠物列表（[{id,size}]）
+          DSH_PET_DESKTOP_PETS: JSON.stringify(desktopPetList()),
+          // 有应用全屏时隐藏桌宠（顶层 hideOnFullscreen）：传 '1' 才在 helper 里开轮询，
+          // 关闭时主进程零开销（连 koffi 都不 require）。判定/隐藏逻辑全在 helper 侧。
+          DSH_PET_DESKTOP_HIDE_ON_FULLSCREEN: hideOnFullscreen() ? '1' : '0',
+          // 窥屏吐槽（pets[].peekEnabled / peekScreenEnabled）：传 '1' 时 helper 才装载 Win32 窗口情报
+          // 与截图能力（desktopCapturer）并暴露给渲染端；关闭时连 koffi/desktopCapturer 都不碰。
+          DSH_PET_DESKTOP_PEEK: peekEnabled() ? '1' : '0',
+        },
+        // bridge 协议处理器 = HTTP 路由同一份 handlePetRoute（业务逻辑唯一，两端天然一致）；
+        // 素材过文件路径（main.js 自行读盘），json/text 过 body
+        bridgeHandler: async (req) => {
+          const result = await handlePetRoute(req.url ?? '/', req.method ?? 'GET', req.body);
+          if (result.kind === 'file') {
+            // file 分支恒 200（404/400 已由 text 分支表达）
+            return { id: req.id, status: 200, contentType: result.contentType, file: result.file };
+          }
+          if (result.kind === 'text') {
+            return { id: req.id, status: result.status, contentType: 'text/plain; charset=utf-8', body: result.body };
+          }
+          return {
+            id: req.id,
+            status: result.status,
+            contentType: 'application/json; charset=utf-8',
+            body: JSON.stringify(result.obj),
+          };
+        },
+      },
+      ctx.logger ?? console,
+    );
+    try {
+      helper.start();
+      ctx.logger?.info?.(`dsh-pet-desktop desktop helper started (config: ${configUrl})`);
+    } catch (e) {
+      ctx.logger?.warn?.(`dsh-pet-desktop desktop helper start failed: ${e instanceof Error ? e.message : String(e)}`);
+      helper = undefined;
+    }
+  };
+
+  /** 拉起桌面 Helper：先探测本机 Electron；缺失时进程内异步下载
+   *  （不 spawn 子进程，CLI node 与 DSH Desktop 均适用），下载完成后自动拉起。 */
+  const startHelper = (): void => {
+    if (helper || electronEnsure || disposed) return;
+    if (!hasDesktopPet) return; // 无宠物显示在桌面（display 含 desktop/both）：不启动
+    // 无图形显示环境（Linux 服务器 / 容器）：直接放弃，不探测、不下载、不拉起。
+    // 否则 Electron 会「拉起即崩」，被守护循环反复重启并刷满 core dump。
+    if (!hasGraphicalDisplay()) {
+      if (!displayWarned) {
+        displayWarned = true;
+        ctx.logger?.warn?.(
+          '[dsh-pet-desktop] 未检测到图形显示环境（DISPLAY/WAYLAND_DISPLAY 均为空），已跳过桌面宠物。' +
+            '浏览器内宠物不受影响；如需在服务器上启用桌面模式，请配置 Xvfb 后设置 DSH_PET_DESKTOP_FORCE=1。',
+        );
+      }
+      return;
+    }
+    const found = resolveElectronPath();
+    if (found) {
+      launchHelper(found);
+      return;
+    }
+    console.warn(`[dsh-pet-desktop] Electron not found, downloading to ${defaultElectronExe()} ...`);
+    electronEnsure = ensureElectronDownload()
+      .then((path) => {
+        if (path) {
+          launchHelper(path);
+        } else {
+          console.warn(
+            '[dsh-pet-desktop] Electron download failed; desktop pet unavailable. Set DSH_PET_DESKTOP_ELECTRON_PATH and restart, or retry later.',
+          );
+        }
+      })
+      .finally(() => {
+        electronEnsure = undefined;
+      });
+  };
+
+  /** 停止桌面 Helper（保留配置，可再次拉起）。宿主退出/插件卸载路径：不等它退干净（见 stopAndWait）。 */
+  const stopHelper = (reason = 'settings-change'): void => {
+    if (startRetryTimer) {
+      clearTimeout(startRetryTimer);
+      startRetryTimer = undefined;
+    }
+    helper?.stop(reason);
+    helper = undefined;
+  };
+
+  /** 停止并**等旧 helper 真正退出**：配置变更触发的"停旧起新"专用（issue #64）。 */
+  const stopHelperAndWait = async (reason: string): Promise<void> => {
+    if (startRetryTimer) {
+      clearTimeout(startRetryTimer);
+      startRetryTimer = undefined;
+    }
+    const old = helper;
+    helper = undefined;
+    await old?.stopAndWait(reason);
+  };
+
+  /**
+   * 宠物配置（display / size 等）变更后：重解析桌面宠物，**等旧 helper 退出**再拉起新的。
+   *
+   * 为什么要等（issue #64）：Electron 收到 SIGTERM 后关窗是异步的（几百 ms 起），"发完 kill 就 spawn
+   * 新进程"会让旧窗口（旧大小）与新窗口（新大小）短暂共存——用户看到的就是"改完大小冒出来第二只宠物"。
+   * 为什么要串行：连续保存会触发多次重启，两次重启交错同样会同时拉起两个 helper，所以用队列串起来。
+   * 队列自身绝不留下 rejected 状态，否则后续保存再也不会重启 helper。
+   */
+  let desktopSyncQueue: Promise<void> = Promise.resolve();
+  const syncDesktop = (): Promise<void> => {
+    desktopSyncQueue = desktopSyncQueue
+      .then(async () => {
+        refreshDesktop();
+        await stopHelperAndWait('desktop-config-change');
+        startHelper();
+      })
+      .catch((e: unknown) => {
+        ctx.logger?.warn?.(`[dsh-pet-desktop] 重启桌面 Helper 失败：${e instanceof Error ? e.message : String(e)}`);
+      });
+    return desktopSyncQueue;
+  };
+
+  /** 扩展名 → 素材子目录名（webm → webm/，mov → mov/；其余落在动画目录平级放行） */
+  const animSubdirFor = (ext: string): string => (ext === '.mov' ? 'mov' : 'webm');
+
+  /** 包内动画素材根：按扩展名取子目录（webm/ 随包发布；mov/ 不存在时为 404 兜底，仅 macOS 自维护）。 */
+  const assetRootFor = (ext: string): string => join(PACKAGE_ROOT, 'assets', animSubdirFor(ext));
+
+  /** 用户动画根：按扩展名取子目录（main-animation/webm 或 main-animation/mov）。 */
+  const userRootFor = (ext: string): string => join(thumbUserRoot, animSubdirFor(ext));
+
+  /** 单次业务路由(WebServer 注册 → HTTP 落盘 / 桌面 Helper 管道 → scheme 应答,共用同一份实现):
+   *  输入只需 rawUrl(/dsh-pet-desktop-7340/... + 查询) + method + body 文本;返回 RouteResult(JSON/文本/文件),
+   *  消费方各自落盘——业务逻辑只有一份,两端天然一致(硬契约:浏览器/桌面行为严格对齐)。 */
+  const handlePetRoute = async (rawUrl: string, method: string, body?: string): Promise<RouteResult> => {
+    const url = new URL(rawUrl, 'http://localhost');
+    const rest = decodeURIComponent(url.pathname.slice(ROUTE_PREFIX.length + 1));
+
+    // 成品配置：/dsh-pet-desktop-7340/config（GET 读取合并成品 / PUT 保存用户层 / POST 同步内置默认）
+    if (rest === 'config') {
+      if (method === 'GET') {
+        // 唯一配置入口：readAllConfig 返回绝对正确的完成品聚合（{ main:{...}, test1:{...} }），
+        // 浏览器/桌面/设置页直接消费，无需任何校验/兜底
+        try {
+          return { kind: 'json', status: 200, obj: readAllConfig(configPaths) };
+        } catch (e) {
+          return { kind: 'json', status: 500, obj: { error: e instanceof Error ? e.message : String(e) } };
+        }
+      }
+      if (method === 'PUT') {
+        try {
+          const parsed = JSON.parse(body ?? '');
+          // 透传保留：读当前磁盘上的用户文件原对象，把非白名单顶层字段（physics/whisperPrompt/
+          // chatMemoryRounds/...）带回给 saveUserConfig——设置页保存不再抹掉用户手改的精调配置。
+          // **必须走 JSONC 容忍解析器**（readUserConfig）：用户层可能是「同步」写入的带 // 注释
+          // 的 config.jsonc 原文，用严格 JSON.parse 会在这里抛错并被吞掉 → existing 变 undefined
+          // → 白名单重建 → 用户的高级字段全丢（老 bug 的复发路径，已由守卫测试钉住）。
+          const existing = readUserConfig(configPaths);
+          const clean = saveUserConfig(parsed, existing);
+          if (!clean) {
+            return {
+              kind: 'json',
+              status: 400,
+              obj: {
+                error:
+                  'invalid pet config: expected { pets:[{name?,id,size,balanceEnabled,display,position:{corner,marginX,marginY}}] }（display 为 web/desktop/both/none 之一；可选顶层 notificationsEnabled / whisperImageEnabled / chatImageEnabled / confineToScreen / hideOnFullscreen 布尔，physics 为完整物理段）',
+              },
+            };
+          }
+          // 损坏预检：用户层存在但连 JSONC 都解析不了（真损坏）→ **先不写盘**。
+          // 保存是白名单重建，existing 读不出来就等于把文件里剩下的内容整份丢掉，而且静默——
+          // 所以回 409 让设置页弹窗（取消 = 不动文件；确认 = 带 ?force=1 强行重建）。
+          if (url.searchParams.get('force') !== '1' && userConfigUnparsable(configPaths)) {
+            return {
+              kind: 'json',
+              status: 409,
+              obj: { error: 'user config is unparsable', needConfirm: true, userFile: userConfigPath },
+            };
+          }
+          await mkdir(userRoot, { recursive: true });
+          await writeFile(userConfigPath, JSON.stringify(clean, null, 2), 'utf8');
+          void syncDesktop(); // display/size 等可能变化：重解析桌面宠物并重启 Helper（异步，不阻塞保存响应）
+          // 响应体 = 保存后的**成品聚合**（与 GET /config 同一份，字段已填满）：
+          // 设置页把它直接交给容器的 flattenConfigPets 拍平渲染——客户端的条目级字段
+          // （动画池/权重/物理参数/工作状态文案）只有这一处填充，不再有第二份补吹实现。
+          return { kind: 'json', status: 200, obj: readAllConfig(configPaths) };
+        } catch {
+          return { kind: 'json', status: 400, obj: { error: 'invalid JSON body' } };
+        }
+      }
+      if (method === 'POST') {
+        // 同步：把内置默认配置（assets/config.jsonc 原文，含注释）整份写入用户配置——
+        // 既是「恢复默认」（合并结果 = 内置默认），又给用户留下一份可直接编辑的完整配置，
+        // 不必再自己从包内复制一份（见 config.ts 的 syncUserConfigFromDefault）。
+        try {
+          syncUserConfigFromDefault(configPaths);
+        } catch (e) {
+          // 默认文件缺失 / 用户目录不可写：显式 500，绝不静默留下半个配置文件
+          return { kind: 'json', status: 500, obj: { error: e instanceof Error ? e.message : String(e) } };
+        }
+        void syncDesktop(); // 配置变了：重解析桌面宠物并重启 Helper（异步，不阻塞响应）
+        return { kind: 'json', status: 200, obj: readAllConfig(configPaths) };
+      }
+      return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+    }
+
+    // 桌面端「重载配置」（右键菜单 → POST /reload）：重启桌面 Helper，全部桌面宠物窗口按最新配置重建。
+    // 与保存走**同一条**重启路径（syncDesktop：串行队列 + 等旧进程真正退出再起新的），
+    // 所以宠物数量 / display / size 的变化同样生效——渲染端就地重拉配置做不到这几项
+    // （每只宠物一个窗口，是宿主启动时按 DSH_PET_DESKTOP_PETS 建的）。
+    // 注意：发起者就是**即将被重启的那个 helper**，本响应不保证送达，因此不 await 重启、立刻回 200。
+    if (rest === 'reload') {
+      if (method !== 'POST') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      void syncDesktop();
+      return { kind: 'json', status: 200, obj: { reloading: true } };
+    }
+
+    // 配置文件路径 + 存储位置清单（设置页「高级配置」与「卸载与存储」展示用）
+    if (rest === 'config/meta') {
+      return {
+        kind: 'json',
+        status: 200,
+        obj: {
+          user: userConfigPath,
+          default: join(PACKAGE_ROOT, 'assets', 'config.jsonc'),
+          animations: thumbUserRoot,
+          // 全部落盘位置（本包用户数据 / Electron 运行时 / 桌面端缓存 / 下载缓存 / 插件本体）：
+          // 前两条直接传真实写入方的路径，不在这里重拼目录名
+          storage: storageEntries({
+            userDataRoot: userRoot,
+            electronDir: electronLandingDir(),
+            home: homedir(),
+            packageRoot: PACKAGE_ROOT,
+          }),
+          // profile 名（拼卸载命令 dsh plugin --profile <名> remove dsh-pet-desktop；反推不出时为空串）
+          profile: profileNameFrom(PACKAGE_ROOT) ?? '',
+        },
+      };
+    }
+
+    // 番茄钟/Todo 状态（宿主串行执行所有动作；浏览器与桌面窗口共享同一权威快照）
+    if (rest === 'productivity') {
+      if (method === 'GET') {
+        try {
+          const snapshot = await reconcileProductivitySnapshot(userRoot);
+          scheduleProductivityDeadline(snapshot);
+          return { kind: 'json', status: 200, obj: snapshot };
+        } catch (e) {
+          return { kind: 'json', status: 500, obj: { error: e instanceof Error ? e.message : String(e) } };
+        }
+      }
+      return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+    }
+
+    if (rest === 'productivity/action') {
+      if (method !== 'POST') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      try {
+        const action = JSON.parse(body ?? '');
+        const snapshot = await mutateProductivitySnapshot(userRoot, action, Date.now());
+        scheduleProductivityDeadline(snapshot);
+        return { kind: 'json', status: 200, obj: snapshot };
+      } catch (e) {
+        return { kind: 'json', status: 400, obj: { error: e instanceof Error ? e.message : String(e) } };
+      }
+    }
+
+    if (rest === 'balance') {
+      if (method !== 'GET') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      try {
+        const sel = ctx.agentDefaultModel.currentSelection();
+        const result = await queryBalance(sel.provider, async (ref) => {
+          const rc = await ctx.credentials.resolve(credentialRef(ref));
+          return rc?.value;
+        });
+        return { kind: 'json', status: 200, obj: result };
+      } catch (e) {
+        // 意外异常（如注入服务缺失）：显式 500，不静默
+        return {
+          kind: 'json',
+          status: 500,
+          obj: {
+            ok: false,
+            provider: 'unknown',
+            reason: 'fetch-error',
+            message: e instanceof Error ? e.message : String(e),
+          },
+        };
+      }
+    }
+
+    // 手动触发计数：/dsh-pet-desktop-7340/balance/trigger（no-cache，浏览器/桌面 1s 轻量轮询；/balance 命令写入）
+    if (rest === 'balance/trigger') {
+      return {
+        kind: 'json',
+        status: 200,
+        obj: { count: balanceTriggerCount },
+        headers: { 'cache-control': 'no-cache, no-store' }, // 触发计数必须实时，禁止任何缓存层介入
+      };
+    }
+
+    // 碎碎念周期文本：/dsh-pet-desktop-7340/whisper?pet=<id>（GET，浏览器/桌面共用）
+    // 按宠物独立生成：每只启用碎碎念的宠物在自己的周期用**所属条目的人设**生成一句话
+    // （文件宠物 = pet/<名>-config.json 顶层 whisperPrompt；主宠物 = main 条目即内置默认）。
+    // 节流/缓存按 pet 分开：同一宠物周期内重复请求返回同一句（ts 不变，client 检测变化才触发），
+    // 同一宠物的多个端（浏览器+桌面窗口）共享一句，不重复调 LLM。
+    if (rest === 'whisper') {
+      if (method !== 'GET') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      try {
+        const petId = String(url.searchParams.get('pet') ?? '');
+        return { kind: 'json', status: 200, obj: await serveWhisper(petId, false) };
+      } catch (e) {
+        return {
+          kind: 'json',
+          status: 200,
+          obj: { ok: false, reason: 'generate-error', message: e instanceof Error ? e.message : String(e) },
+        };
+      }
+    }
+
+    // 碎碎念手动触发：/dsh-pet-desktop-7340/whisper/trigger?pet=<id>（GET，右键菜单「碎碎念」用）
+    // 与周期端点同一逻辑，但 force=true：绕过节流缓存立即强制新生成一句并刷新缓存
+    // （同宠物周期轮询端下次拉取看到新 ts 也会跟着展示——与 /balance/trigger 同语义）。
+    if (rest === 'whisper/trigger') {
+      if (method !== 'GET') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      try {
+        const petId = String(url.searchParams.get('pet') ?? '');
+        return { kind: 'json', status: 200, obj: await serveWhisper(petId, true) };
+      } catch (e) {
+        return {
+          kind: 'json',
+          status: 200,
+          obj: { ok: false, reason: 'generate-error', message: e instanceof Error ? e.message : String(e) },
+        };
+      }
+    }
+
+    // 窥屏吐槽：/dsh-pet-desktop-7340/peek?pet=<id>
+    //   POST {context:{windowTitle?,processName?,idleSeconds?}, image?:{base64,mediaType}} → {ok,text,ts,image?}
+    //   情报由发起端提供（只有桌面 helper 能问 Windows 前台窗口）；番茄钟情报由 host 自己读。
+    // 窥屏手动触发（右键菜单「窥屏吐槽」）：POST .../peek?pet=<id>&force=1 —— 绕过节流立即来一句。
+    if (rest === 'peek') {
+      if (method !== 'POST') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      const petId = String(url.searchParams.get('pet') ?? '');
+      try {
+        const parsed = (JSON.parse(body ?? 'null') as Record<string, unknown> | null) ?? {};
+        const force = url.searchParams.get('force') === '1';
+        return {
+          kind: 'json',
+          status: 200,
+          obj: await servePeek(petId, parsed.context, parsed.image, force),
+        };
+      } catch (e) {
+        return {
+          kind: 'json',
+          status: 200,
+          obj: { ok: false, reason: 'generate-error', message: e instanceof Error ? e.message : String(e) },
+        };
+      }
+    }
+
+    // 提醒音：/dsh-pet-desktop-7340/sfx?pet=<id>（GET）
+    //   返回 { enabled, volume, url, pending:{id,ts}|null, missing? }。客户端 1s 轮询（关掉时放慢到 10s）。
+    //   多端只响一次靠认领：看到 pending.id → POST /sfx/claim，先到先得。
+    if (rest === 'sfx') {
+      if (method !== 'GET') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      return { kind: 'json', status: 200, obj: readSfxState() };
+    }
+
+    // 提醒音认领：/dsh-pet-desktop-7340/sfx/claim?pet=<id>（POST {id}）
+    //   只有拿到 play=true 的客户端才播——桌面宠物窗口 N 个 + 浏览器页面同时在线时不会合唱。
+    if (rest === 'sfx/claim') {
+      if (method !== 'POST') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      let id: unknown;
+      try {
+        id = ((JSON.parse(body ?? 'null') as { id?: unknown } | null) ?? {}).id;
+      } catch {
+        return { kind: 'json', status: 200, obj: { ok: false, play: false, error: 'invalid JSON body' } };
+      }
+      return { kind: 'json', status: 200, obj: { ok: true, play: sfxCues.claim(id) } };
+    }
+
+    // 对话：/dsh-pet-desktop-7340/chat?pet=<id>
+    //   GET  —— 最近记忆窗口（截尾 chatMemoryRounds 轮），弹窗打开时展示
+    //   POST —— 携带历史生成回复并写入记忆（{text} → {ok, reply, ts}）
+    // 记忆唯一读写方 = host（memory.json；浏览器/桌面两端都只是客户端）→
+    // 同一实例的浏览器与桌面天然共享同一份记忆；文件全存不删，
+    // 请求只截尾部 chatMemoryRounds 轮（1 轮 = 1 问 1 答；合并器已按条目填默认）。
+    if (rest === 'chat') {
+      const petId = String(url.searchParams.get('pet') ?? '');
+      try {
+        if (method === 'GET') {
+          const cfg = readAllConfig(configPaths);
+          const mem = await readMemory();
+          const bucket = mem[findPetInstance(cfg, petId)?.entry ?? petId] ?? {};
+          const list = (bucket[petId]?.messages ?? []).slice();
+          const rounds = memoryRounds(petId, cfg);
+          return { kind: 'json', status: 200, obj: { ok: true, messages: list.slice(-rounds * 2), rounds } };
+        }
+        if (method === 'POST') {
+          const parsed = (JSON.parse(body ?? 'null') as Record<string, unknown> | null) ?? {};
+          const text = typeof parsed.text === 'string' ? parsed.text.trim() : '';
+          if (!text) {
+            return { kind: 'json', status: 200, obj: { ok: false, reason: 'bad-request', message: '消息为空' } };
+          }
+          if (text.length > 2000) {
+            return {
+              kind: 'json',
+              status: 200,
+              obj: { ok: false, reason: 'bad-request', message: '消息过长（限 2000 字）' },
+            };
+          }
+          const result = await chatWithPet(petId, text);
+          return { kind: 'json', status: 200, obj: result };
+        }
+        return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      } catch (e) {
+        // 配置已由 readAllConfig 保证正确（不再有 config-error 分支）；其余（IO/LLM）→ generate-error
+        return {
+          kind: 'json',
+          status: 200,
+          obj: { ok: false, reason: 'generate-error', message: e instanceof Error ? e.message : String(e) },
+        };
+      }
+    }
+
+    // 命令触发气泡广播：/dsh-pet-desktop-7340/broadcast?pet=<id>（GET，no-cache）
+    // /chat 命令把碎碎念/对话文本（+配图名，与 /whisper 同契约）写入 broadcastCache，
+    // 浏览器/桌面 1s 轻量轮询拉取，ts 变化即弹气泡——与 /balance/trigger 同语义
+    // （无缓存返回 ts=0，轮询侧恒定不触发）
+    if (rest === 'broadcast') {
+      if (method !== 'GET') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      const petId = String(url.searchParams.get('pet') ?? '');
+      const hit = broadcastCache.get(petId);
+      return {
+        kind: 'json',
+        status: 200,
+        obj: { ok: true, text: hit?.text ?? '', image: hit?.image, ts: hit?.ts ?? 0 },
+        headers: { 'cache-control': 'no-cache, no-store' },
+      };
+    }
+
+    // 工作状态联动：/dsh-pet-desktop-7340/work-status（GET，no-cache）
+    // host 监听 DSH session/event 聚合出"当前活动状态"（WorkStatusStore：state 与 task 同取优先级
+    // 最高的会话）；浏览器 1s 轻量轮询拉取，ts 变化即按 events.workStatus 档位播动画 + 弹气泡。
+    // 空闲（无会话活动）state=null、task=null；不调用任何模型。
+    if (rest === 'work-status') {
+      if (method !== 'GET') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      return {
+        kind: 'json',
+        status: 200,
+        obj: workStatus.snapshot(),
+        headers: { 'cache-control': 'no-cache, no-store' },
+      };
+    }
+
+    // 系统通知帧：/dsh-pet-desktop-7340/notify?since=<seq>（GET，no-cache）
+    // host 监听 DSH session/event + agent/error 生成通知帧（帧契约 = shared/notify.ts），
+    // 浏览器 1s 轮询增量拉取（只返回 seq>since 的帧）；无 since 时返回全量队列
+    //（浏览器首拉记基线 seq，不重放历史——与 broadcast/work-status 首次记基线同语义）。
+    if (rest === 'notify') {
+      if (method !== 'GET') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      const since = Number(url.searchParams.get('since') ?? '0');
+      const frames = notifyFrames.filter((f) => f.seq > since).map((f) => f.frame);
+      return {
+        kind: 'json',
+        status: 200,
+        obj: { ok: true, seq: notifySeq, frames },
+        headers: { 'cache-control': 'no-cache, no-store' },
+      };
+    }
+
+    // 动画文件：/dsh-pet-desktop-7340/thumb/<素材根>/<file>，扩展名 webm（默认）/ mov（macOS 定制）。
+    // 素材归属按「是否存在该宠物的独立素材目录 `pet/<petId>-animation/`」判定：
+    //   - 存在（pet pack 宠物）：只查自己的目录，查不到即 404 显式报错——绝不混用
+    //   - 不存在（**所有主配置宠物**，main 与用户添加的任意多只）：主素材链
+    //     main-animation/<webm|mov> 优先 → 包内 assets/<webm|mov>（与宠物数量无关，多只共用）
+    // mov（HEVC-with-Alpha）为 macOS Safari/WKWebView 定制格式：默认不随包发布，
+    // 用户从 GitHub Release（assets-mov）下载后放 main-animation/mov/，并把客户端播放
+    // 扩展名常量（src/shared/constants.ts 的 ANIMATION_EXT / 产物 lib/client.js）改为 .mov。
+    // 注意：font / pic 是扁平的 /<scope>/<file>，只有 thumb 是 /<scope>/<petId>/<file>——
+    // 这里先拆 scope，再按 scope 各自拆剩余段，避免 font/pic 被误当作 petId 吞掉文件段。
+    const [scope, ...restParts] = rest.split('/');
+    if (scope === 'font') {
+      const fontRoot = join(PACKAGE_ROOT, 'assets', 'fonts');
+      const fontFile = resolveExisting(fontRoot, restParts.join('/'));
+      if (fontFile === undefined) return { kind: 'text', status: 404, body: 'dsh-pet-desktop: font not found' };
+      const ext = fontFile.slice(fontFile.lastIndexOf('.')).toLowerCase();
+      return { kind: 'file', file: fontFile, contentType: MIME[ext] ?? 'application/octet-stream' };
+    }
+
+    // 通知图标：/dsh-pet-desktop-7340/pic/<file> → 包内 assets/pic（方形 png，系统通知 icon 用）
+    // 表情包同走 pic 前缀（/pic/memes/<名称>.png → 包内 assets/memes）——都是"包内静态图"，
+    // 共用一条路由与防穿越校验；名称含中文，URL 段已在上方 decodeURIComponent 解码。
+    if (scope === 'pic') {
+      const isMeme = restParts[0] === 'memes';
+      const picRoot = join(PACKAGE_ROOT, 'assets', isMeme ? 'memes' : 'pic');
+      const picFile = resolveExisting(picRoot, (isMeme ? restParts.slice(1) : restParts).join('/'));
+      if (picFile === undefined) return { kind: 'text', status: 404, body: 'dsh-pet-desktop: pic not found' };
+      const ext = picFile.slice(picFile.lastIndexOf('.')).toLowerCase();
+      return { kind: 'file', file: picFile, contentType: MIME[ext] ?? 'application/octet-stream' };
+    }
+
+    // 提醒音素材：/dsh-pet-desktop-7340/sound/<file> → 用户 main-sound/<file> 优先，包内 assets/sound 兜底。
+    // 与动画素材同套路（用户产物优先、包内兜底），文件名白名单校验在 resolveSoundFile 里（防穿越）。
+    if (scope === 'sound') {
+      const name = restParts.join('/');
+      const soundFile = resolveSoundFile({ userRoot, packageRoot: PACKAGE_ROOT }, name);
+      if (soundFile === undefined) return { kind: 'text', status: 404, body: 'dsh-pet-desktop: sound not found' };
+      return { kind: 'file', file: soundFile, contentType: soundMime(name) };
+    }
+
+    if (scope !== 'thumb') {
+      return {
+        kind: 'text',
+        status: 400,
+        body: 'dsh-pet-desktop: expected /dsh-pet-desktop-7340/thumb/<petId>/<file>',
+      };
+    }
+    // thumb 是三段式：/<scope>/<petId>/<file>——从这里再拆宠物 id 与文件名
+    const [petId, ...nameParts] = restParts;
+    if (!petId || nameParts.length === 0) {
+      return {
+        kind: 'text',
+        status: 400,
+        body: 'dsh-pet-desktop: expected /dsh-pet-desktop-7340/thumb/<petId>/<file>',
+      };
+    }
+    // petId 是**标识符**（= pet/<名>-animation/ 的 <名>，来源是 pet/ 下的文件名前缀），不是路径片段：
+    // 含分隔符/保留字符即显式 400，早于任何路径拼接判定。合法名（含中文）照常——
+    // 用非法字符类而不是 ASCII 白名单。非法输入不再静默回落到主素材池（攻击尝试与"没有独立素材"可区分），
+    // 也给下面的 resolveAsset 之外再留一道结构性防线。
+    if (ID_FORBIDDEN.test(petId)) {
+      return { kind: 'text', status: 400, body: 'dsh-pet-desktop: invalid pet id' };
+    }
+    const fileName = nameParts.join('/');
+    const ext = fileName.slice(fileName.lastIndexOf('.')).toLowerCase();
+    if (ext !== '.webm' && ext !== '.mov') {
+      return {
+        kind: 'text',
+        status: 400,
+        body: 'dsh-pet-desktop: unsupported animation format (expected .webm or .mov)',
+      };
+    }
+    // 素材归属（按是否存在该宠物的独立素材目录判定，绝不静默混用）：
+    //   - 存在 `pet/<petId>-animation/`（pet pack 宠物，URL 段 = 素材根 assetRoot）：
+    //     只查自己的目录，查不到即 404 显式报错——绝不回落别的素材
+    //   - 不存在（**所有主配置宠物**：main 及用户添加的任意多只，共用全局动画池）：
+    //     主素材链——用户 main-animation/<ext 子目录> 优先，其次包内 assets/<ext 子目录>
+    // extraAnimDir 必须先过 resolveAsset：petId 是解码后的 URL 段，Windows 上 %5C 解出的
+    // 反斜杠不会被 rest.split('/') 切开，直接 join 会让 `..\..\x` 逃出用户根读盘。
+    const extraAnimDir = resolveAsset(petConfigDir, petId + '-animation');
+    const file =
+      extraAnimDir !== undefined && existsSync(extraAnimDir)
+        ? resolveExisting(extraAnimDir, fileName)
+        : (resolveExisting(userRootFor(ext), fileName) ?? resolveExisting(assetRootFor(ext), fileName));
+    if (file === undefined) return { kind: 'text', status: 404, body: 'dsh-pet-desktop: asset not found' };
+    return { kind: 'file', file, contentType: MIME[ext] ?? 'application/octet-stream' };
+  };
+
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: 'prefix',
+        path: ROUTE_PREFIX,
+        handler: async (req: IncomingMessage, res: ServerResponse) => {
+          try {
+            const body = req.method === 'PUT' || req.method === 'POST' ? await readBody(req) : undefined;
+            const result = await handlePetRoute(req.url ?? '/', req.method ?? 'GET', body);
+            if (result.kind === 'json') sendJson(res, result.status, result.obj, result.headers);
+            else if (result.kind === 'text') sendText(res, result.status, result.body);
+            else sendFile(res, result.file, result.contentType); // 非 async：流在 open 后自己 pipe，错误内部收口
+          } catch (e) {
+            sendJson(res, 500, { error: e instanceof Error ? e.message : String(e) });
+          }
+        },
+      }),
+    'dsh-pet-desktop: /dsh-pet-desktop-7340 asset route',
+  );
+
+  // 工作状态联动：监听 DSH 会话事件 → 聚合"当前活动状态"（WorkStatusStore → 展示快照）。
+  // 消费的事件：turn/start、user/message（goal 续跑轮判定）、tool/call（update_goal 收尾判定）、
+  // tool/result、approval/asked、turn/end、todo/write（只更新任务详情文案，不切档位）。
+  // 纯监听不调用模型；有宠物启用 workStatusEnabled 时才被浏览器侧消费（host 侧恒轻量监听）。
+  ctx.effect(() => {
+    const dispose = ctx.on('session/event', (session: unknown, event: unknown) => {
+      const type = (event as { type?: string } | null)?.type;
+      if (!type) return;
+      const sessionId = String(
+        (session as { id?: unknown; header?: { id?: unknown } } | null)?.header?.id ??
+          (session as { id?: unknown } | null)?.id ??
+          'unknown',
+      );
+      if (type === 'todo/write') {
+        // 任务详情文案：只写**该会话**的条目（state/task 同源，不再有全局字段，也就不可能串会话）。
+        // 会话没有活动条目（已空闲/已清理）→ 不动：它不会被展示，写进去只会成为一条"幽灵文案"。
+        // 清单里再无 in_progress/pending 时 currentTaskFromTodo 返回 null，等于把旧文案清掉、
+        // 气泡回落到档位文案（issue #59 缺陷 3：档位文案不该被一条历史记录永久屏蔽）。
+        if (workStatus.has(sessionId)) {
+          workStatus.setTask(
+            sessionId,
+            currentTaskFromTodo(event as { data?: { todos?: Array<{ status?: string; content?: string }> } }),
+          );
+        }
+        return;
+      }
+      if (type === 'user/message') {
+        // 目标续跑轮判定：自动轮的消息带 source.kind==='goal'（round>0），该轮属自动续跑，
+        // 其 turn/end completed 只是"本轮完成"，不是整个任务完成
+        const source = (event as { data?: { source?: { kind?: string } } })?.data?.source;
+        if (source?.kind === 'goal') {
+          const flags = turnFlags.get(sessionId) ?? { goalRound: false, closing: null };
+          flags.goalRound = true;
+          turnFlags.set(sessionId, flags);
+        }
+        return; // user/message 不驱动档位动画
+      }
+      if (type === 'turn/start') {
+        turnFlags.set(sessionId, { goalRound: false, closing: null }); // 新一轮：清 turn 级标志
+        // 新一轮也开始新的任务上下文：清掉上一轮留下的任务详情文案（issue #59），否则它会一直挂着。
+        // 代价：goal 续跑这类多轮任务，每轮开头会回落一瞬档位文案，直到本轮（通常在开头几步内）
+        // 再写一次 todo 清单。
+        workStatus.setTask(sessionId, null);
+      }
+      if (
+        type === 'tool/call' &&
+        String((event as { data?: { name?: unknown } })?.data?.name ?? '') === GOAL_UPDATE_TOOL
+      ) {
+        // update_goal complete/blocked = 本轮是该目标的收尾轮，其 completed 才是真完成
+        const action = goalUpdateAction(String((event as { data?: { arguments?: unknown } })?.data?.arguments ?? ''));
+        if (action) {
+          const flags = turnFlags.get(sessionId) ?? { goalRound: false, closing: null };
+          flags.closing = action;
+          turnFlags.set(sessionId, flags);
+        }
+      }
+      const next = reduceWorkStatus(
+        event as { type?: string; data?: Record<string, unknown> & { reason?: { kind?: string } } },
+        turnFlags.get(sessionId),
+      );
+      if (!next) {
+        // turn/end 的 null（aborted / 未知 kind）＝该会话回合已结束：清掉会话状态，让展示回到空闲或
+        // 落到其他活跃会话，防止回合被打断后永久卡在上一档；其他事件的 null 是"不关心"，忽略。
+        if (type === 'turn/end') {
+          turnFlags.delete(sessionId);
+          cancelTerminalCleanup(sessionId); // 条目都要清了，别留一个到点后无事可做的定时器
+          workStatus.clear(sessionId); // 条目连同任务详情文案一起消失（clear 内部会重算展示）
+        }
+        return;
+      }
+      // 「需要你做决定」提醒音：waiting 的三个来源就是"模型在等你拍板"——
+      //   approval/asked（权限申请）、tool/call ask_user_question（等你回答）、turn/end blocked（回合被阻塞）。
+      // 有意放在 setState 去重**之前**：同一个会话连续两次权限申请也是两次决策，各响一次；
+      // 极短时间内的连击由 CueStore 的最小间隔挡掉。
+      if (next === 'waiting') sfxCues.fire();
+      const seq = Number((event as { seq?: unknown }).seq ?? 0);
+      // 同会话同状态不重复更新（防刷屏）；不同状态才改写并重算展示
+      if (!workStatus.setState(sessionId, next, seq)) return;
+      // 终态只展示短暂窗口后自动清理：陈旧完成态不再浮上来（Bug 3 的一环，顺带缓解 Bug 2 残留）。
+      // 回到非终态则取消那次待执行的清理——否则它到点时会话已非终态，既不清也不重排，
+      // 条目（连同旧任务文案）就永久留下了。
+      if (next === 'success' || next === 'error') scheduleTerminalCleanup(sessionId);
+      else cancelTerminalCleanup(sessionId);
+    });
+    return () => {
+      dispose();
+      for (const t of terminalTimers.values()) clearTimeout(t);
+      terminalTimers.clear();
+    };
+  }, 'dsh-pet-desktop: work-status session events');
+
+  // 系统通知：监听 DSH 宿主事件 → 生成通知帧入队（浏览器轮询 /notify 拉取弹 toast）。
+  // 与 work-status 同一 session/event 源，但职责各自独立（通知帧 = 事件 → toast 的一对一映射，
+  // 不做状态聚合）。帧契约与 shared/notify.ts 完全一致，浏览器侧映射零改动。
+  //   事件源：turn/end（完成/失败/截断）、approval/asked（权限申请）、
+  //          tool/call（ask_user_question：用户选择）、agent/error（无回合位置失败，0.1.5 新增）。
+  // 纯监听不调用模型；通知是浏览器网页端能力，桌面模式不消费本队列（不影响任何宠物行为）。
+  ctx.effect(() => {
+    const sessionDispose = ctx.on(
+      'session/event',
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (_session: any, event: any) => {
+        const frame = reduceNotifyFrame(event as Parameters<typeof reduceNotifyFrame>[0]);
+        if (frame) pushNotifyFrame(frame);
+      },
+    );
+    // agent/error（agent-loop dispatch.emit）：无回合位置的生成失败；0.1.5 新增，
+    // 旧版无此事件 = 少一条通知（turn/end error 分支已覆盖大部分失败场景），不报错。
+    const errorDispose = ctx.on(
+      'agent/error',
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (payload: any) => {
+        pushNotifyFrame(agentErrorFrame(payload?.error));
+      },
+    );
+    return () => {
+      sessionDispose();
+      errorDispose();
+    };
+  }, 'dsh-pet-desktop: notify frames');
+
+  // /balance 斜杠命令：递增触发计数 → 浏览器/桌面检测到变化后立即刷新余额
+  // （成功播档位动画 + 余额气泡；服务商不支持/缺凭证/抓取失败则弹文字说明气泡，绝不静默）
+  ctx.effect(
+    () =>
+      ctx.commands.register({
+        name: 'balance',
+        description: '手动触发桌宠余额显示（立即弹出余额气泡）',
+        handler: () => {
+          balanceTriggerCount += 1;
+          return { kind: 'success', text: '已触发桌宠余额显示' };
+        },
+      }),
+    'dsh-pet-desktop: /balance command',
+  );
+
+  // /pet 斜杠命令：选择「当前桌宠」（/chat 对话的目标）。浏览器端另有 commandUi 装饰的选择框
+  // （裸输 /pet 回车或菜单点选时弹出，选中后提交 /pet <id> 走同一 handler）；手输参数认 id 或名字
+  // （name 可重复：唯一命中才认，重名报错列出候选 id）。
+  ctx.effect(
+    () =>
+      ctx.commands.register({
+        name: 'pet',
+        description: '选择桌宠（/chat 对话的目标；支持选择框或手输 id/名字）',
+        input: { hint: '[宠物 id 或名字]（留空查看当前）' },
+        handler: ({ rawInput }: { rawInput: string }) => {
+          const arg = rawInput.trim();
+          let eff: Record<string, unknown>[];
+          try {
+            eff = effectivePetList();
+          } catch {
+            eff = [];
+          }
+          if (!arg) {
+            const cur = resolveActivePetId();
+            const found = eff.find((p) => String(p.id) === cur);
+            return {
+              kind: 'success',
+              text: '当前桌宠：' + (found ? petDisplayName(found) : cur || '（无可交互桌宠）'),
+            };
+          }
+          const byId = eff.find((p) => String(p.id) === arg);
+          if (byId) {
+            activePetId = String(byId.id);
+            return { kind: 'success', text: '已选择桌宠：' + petDisplayName(byId) };
+          }
+          const byName = eff.filter((p) => petDisplayName(p) === arg);
+          if (byName.length === 1) {
+            activePetId = String(byName[0].id);
+            return { kind: 'success', text: '已选择桌宠：' + petDisplayName(byName[0]) };
+          }
+          if (byName.length > 1) {
+            return {
+              kind: 'error',
+              text:
+                '「' +
+                arg +
+                '」有 ' +
+                byName.length +
+                ' 只桌宠（id：' +
+                byName.map((p) => String(p.id)).join('、') +
+                '），请用 id 指定',
+            };
+          }
+          return { kind: 'error', text: '找不到桌宠「' + arg + '」（id 或名字都行；/pet 回车可打开选择框）' };
+        },
+      }),
+    'dsh-pet-desktop: /pet command',
+  );
+
+  // /chat 斜杠命令：与当前桌宠对话。无参数 = 碎碎念一句（手动语义：绕过节流立即新生成，不受
+  // whisperEnabled 门控）；有参数 = 正常对话（走 /chat 端点同一条路径：记忆 + 人设 + 写盘）。
+  // 两分支的文本都写入广播缓存 → 浏览器/桌面 1s 轮询 /broadcast 拉取后弹气泡展示。
+  ctx.effect(
+    () =>
+      ctx.commands.register({
+        name: 'chat',
+        description: '与桌宠对话：留空 = 碎碎念一句；输入消息 = 正常对话',
+        input: { hint: '[消息]（留空 = 碎碎念）' },
+        handler: async ({ rawInput }: { rawInput: string }) => {
+          const petId = resolveActivePetId();
+          if (!petId) return { kind: 'error', text: '没有可交互的桌宠' };
+          const text = rawInput.trim();
+          try {
+            if (!text) {
+              // 碎碎念：force=true 立即生成并刷新周期缓存（同宠物两端轮询 /whisper 也会跟着展示）
+              const w = await serveWhisper(petId, true);
+              if (!w.ok) {
+                return { kind: 'error', text: '碎碎念生成失败' + (w.message ? '：' + w.message : '') };
+              }
+              broadcastTo(petId, w.text ?? '', w.image);
+              return { kind: 'success', text: w.text ?? '' };
+            }
+            if (text.length > 2000) return { kind: 'error', text: '消息过长（限 2000 字）' };
+            const r = await chatWithPet(petId, text);
+            if (!r.ok) {
+              return { kind: 'error', text: '对话失败' + (r.message ? '：' + r.message : '') };
+            }
+            broadcastTo(petId, r.reply, r.image);
+            return { kind: 'success', text: r.reply };
+          } catch (e) {
+            return { kind: 'error', text: '对话失败：' + (e instanceof Error ? e.message : String(e)) };
+          }
+        },
+      }),
+    'dsh-pet-desktop: /chat command',
+  );
+
+  // 系统通知的宿主监听已在上方注册（notify frames effect）：host 监听 session/event +
+  // agent/error 生成通知帧入队，浏览器轮询 /notify 拉取弹 toast（DSH 0.1.5 删除了浏览器侧
+  // api.events.mux/host 事件流，通知与宠物一样改走 host 通道，两端行为一致）。
+
+  // 随插件生命周期清理：桌面 Helper 回收（异步下载完成后不再拉起）
+  ctx.effect(() => () => {
+    disposed = true;
+    stopHelper('dsh-host-stop');
+  });
+
+  // 路由就绪后拉起桌面 Helper（Electron 缺失时仅告警，不影响 DSH 与浏览器 overlay）
+  startHelper();
+}

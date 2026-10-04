@@ -1,0 +1,695 @@
+/**
+ * host 配置合并单元测试 —— 钉住 animations.events 槽位「string | string[]」校验：
+ * 数组槽位（档内随机候选）必须放行；空字符串 / 空数组 / 数字 / 对象等非法槽位
+ * 必须整段回退内置默认（否则会导致 events 全丢）。
+ *
+ * 走完整的 readAllConfig 管线（内置默认 + 用户主配置合并，与生产同一路径），
+ * 不单独导出校验函数。用临时目录隔离真实文件。
+ *
+ * 跑法：node --experimental-strip-types --test src/host/config.test.ts
+ */
+import { test, describe } from 'node:test';
+import assert from 'node:assert/strict';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
+
+import {
+  migrateUserConfig,
+  readAllConfig,
+  readUserConfig,
+  saveUserConfig,
+  syncUserConfigFromDefault,
+  userConfigUnparsable,
+  type ConfigPaths,
+} from './config.ts';
+
+/** 内置默认配置的完整最小形态（animations 整段必须合法——合并是整段替换/整段回退）。
+ *  注意：这份 fixture 的字段集必须与 assets/config.jsonc 保持一致——合并器有个既有行为：
+ *  用户层没写 pets 时**原样返回内置默认的 pet 对象**（不逐字段补全），所以内置默认里缺哪个字段，
+ *  那条路径下的成品就缺哪个字段（生产环境靠"内置默认始终完整"来保证一致性）。 */
+const BASE = {
+  pets: [
+    {
+      id: 'main',
+      name: '主宠',
+      size: 462,
+      balanceEnabled: false,
+      whisperEnabled: false,
+      workStatusEnabled: false,
+      peekEnabled: false,
+      display: 'web',
+      position: { corner: 'bottom-right', marginX: 40, marginY: 40 },
+    },
+  ],
+  animations: {
+    idle: ['待机'],
+    turn: ['转向'],
+    drag: ['拖拽'],
+    clicks: ['点击'],
+    moves: {
+      default: { minDist: 100, maxDist: 300, margin: 100, leadSec: 0.2, tailSec: 0.2 },
+      actions: [{ name: '走动', params: {} }],
+    },
+    categories: [],
+    events: {
+      balance: ['余额A'],
+      whisper: ['碎碎念A'],
+      workStatus: ['工作A', '工作B'],
+    },
+  },
+  animationWeights: { idle: 10, turn: 5, move: 5 },
+  physics: {
+    gravity: 1400,
+    restitution: 0.78,
+    groundFriction: 2.5,
+    ceilingBounce: true,
+    throwPower: 1.0,
+    petCollision: false,
+  },
+  whisperPrompt: '你是桌面宠物',
+  chatMemoryRounds: 4,
+  notificationsEnabled: true,
+  eventsRefreshSec: { balance: 1800, whisper: 300, peek: 600 },
+  workStatusTexts: [['在干活']],
+};
+
+/** 与 BASE.animations 同构、仅替换 events 的用户层 animations（顶层字段整段替换，故必须完整） */
+function animationsWithEvents(events: unknown): Record<string, unknown> {
+  return { ...BASE.animations, events };
+}
+
+interface Suite {
+  overlay: Record<string, unknown>;
+  /** 期望合并后 events.workStatus 与哪个对象一致 */
+  expectWorkStatus: unknown[];
+}
+
+function cases(suite: Suite): void {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-pet-desktop-config-test-'));
+  try {
+    const paths: ConfigPaths = {
+      defaultFile: join(dir, 'default.jsonc'),
+      userFile: join(dir, 'main-config.jsonc'),
+      petDir: join(dir, 'pet'), // 不存在 = 无文件宠物，scanPetFiles 兜底
+    };
+    writeFileSync(paths.defaultFile, JSON.stringify(BASE));
+    writeFileSync(paths.userFile, JSON.stringify(suite.overlay));
+    const merged = readAllConfig(paths);
+    const workStatus = (merged.main.animations as Record<string, unknown>).events as {
+      workStatus: unknown[];
+    };
+    assert.deepEqual(workStatus.workStatus, suite.expectWorkStatus);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe('readAllConfig —— events 槽位 string | string[] 校验', () => {
+  test('字符串槽位原样放行（原行为不变）', () => {
+    cases({
+      overlay: { animations: animationsWithEvents({ workStatus: ['工作A', '工作B'] }) },
+      expectWorkStatus: ['工作A', '工作B'],
+    });
+  });
+
+  test('数组槽位放行（档内随机候选，完整向后兼容字符串）', () => {
+    cases({
+      overlay: {
+        animations: animationsWithEvents({
+          balance: BASE.animations.events.balance, // 既有规则：events.balance 必填非空数组（用户改 workStatus 会保留）
+          whisper: BASE.animations.events.whisper,
+          workStatus: [['工作思考', '开始工作'], '认真工作', '长时间工作看表', '工作被打扰', '工作结束', '摸鱼被抓'],
+        }),
+      },
+      expectWorkStatus: [['工作思考', '开始工作'], '认真工作', '长时间工作看表', '工作被打扰', '工作结束', '摸鱼被抓'],
+    });
+  });
+
+  test('空字符串槽位非法 → animations 整段回退默认', () => {
+    cases({
+      overlay: { animations: animationsWithEvents({ workStatus: ['工作A', ''] }) },
+      expectWorkStatus: BASE.animations.events.workStatus,
+    });
+  });
+
+  test('空数组槽位非法 → 整段回退默认', () => {
+    cases({
+      overlay: { animations: animationsWithEvents({ workStatus: [['工作A'], []] }) },
+      expectWorkStatus: BASE.animations.events.workStatus,
+    });
+  });
+
+  test('数组内空字符串成员非法 → 整段回退默认', () => {
+    cases({
+      overlay: { animations: animationsWithEvents({ workStatus: [['工作A', ''], '工作B'] }) },
+      expectWorkStatus: BASE.animations.events.workStatus,
+    });
+  });
+
+  test('数字/对象槽位非法 → 整段回退默认', () => {
+    for (const bad of [42 as unknown, { name: 'x' } as unknown, null as unknown, true as unknown]) {
+      cases({
+        overlay: { animations: animationsWithEvents({ workStatus: [bad, '工作B'] }) },
+        expectWorkStatus: BASE.animations.events.workStatus,
+      });
+    }
+  });
+});
+
+describe('readAllConfig —— events 缺失仍回退默认（既有行为不回退）', () => {
+  test('用户层完全没写 animations → 用内置默认', () => {
+    cases({
+      overlay: { whisperPrompt: '改个提示词' },
+      expectWorkStatus: BASE.animations.events.workStatus,
+    });
+  });
+});
+
+/** 跑一趟 readAllConfig：base 为内置默认（可注入表情包开关），overlay 为用户层 */
+function withBase(baseExtra: Record<string, unknown>, overlay?: Record<string, unknown>): ConfigPaths {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-pet-desktop-config-test-'));
+  const paths: ConfigPaths = {
+    defaultFile: join(dir, 'default.jsonc'),
+    userFile: join(dir, 'main-config.jsonc'),
+    petDir: join(dir, 'pet'),
+  };
+  writeFileSync(paths.defaultFile, JSON.stringify({ ...BASE, ...baseExtra }));
+  if (overlay) writeFileSync(paths.userFile, JSON.stringify(overlay));
+  return paths;
+}
+
+/** 跑一趟 saveUserConfig：返回写入用户层的对象（null = 被 sanitize 拒绝） */
+function saveOnce(body: Record<string, unknown>, existing?: Record<string, unknown>): Record<string, unknown> | null {
+  return saveUserConfig(body, existing) as Record<string, unknown> | null;
+}
+
+/** 建一套路径：默认文件 = BASE；用户层原文由调用方给（可带注释） */
+function pathsWithUser(raw: string | null): { paths: ConfigPaths; dir: string } {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-pet-desktop-user-config-'));
+  const paths: ConfigPaths = {
+    defaultFile: join(dir, 'default.jsonc'),
+    userFile: join(dir, 'main-config.jsonc'),
+    legacyUserFile: join(dir, 'main-config.json'),
+    petDir: join(dir, 'pet'),
+  };
+  writeFileSync(paths.defaultFile, JSON.stringify(BASE));
+  if (raw !== null) writeFileSync(paths.userFile, raw);
+  return { paths, dir };
+}
+
+describe('migrateUserConfig —— 老用户 main-config.json → main-config.jsonc', () => {
+  /** 只在旧路径写一份用户层（模拟升级前的老用户） */
+  function legacyOnly(raw: string): { paths: ConfigPaths; dir: string } {
+    const { paths, dir } = pathsWithUser(null);
+    writeFileSync(paths.legacyUserFile as string, raw);
+    return { paths, dir };
+  }
+
+  test('旧文件存在、新文件不存在 → 重命名（内容一字不动），旧文件消失', () => {
+    const raw = '// 老用户的配置\n{\n  "physics": ' + JSON.stringify(BASE.physics) + '\n}\n';
+    const { paths, dir } = legacyOnly(raw);
+    try {
+      const logs: string[] = [];
+      assert.equal(
+        migrateUserConfig(paths, (m) => logs.push(m)),
+        true,
+      );
+      assert.equal(existsSync(paths.legacyUserFile as string), false, '旧文件应已重命名走');
+      assert.equal(readFileSync(paths.userFile, 'utf8'), raw, '新文件内容必须与旧文件逐字节一致');
+      assert.equal(logs.length, 1, '迁移应留一条日志');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('新文件已存在 → 什么都不做（绝不用旧文件覆盖新文件）', () => {
+    const { paths, dir } = pathsWithUser('{ "physics": ' + JSON.stringify(BASE.physics) + ' }\n');
+    try {
+      writeFileSync(paths.legacyUserFile as string, '{ "physics": { "gravity": 1 } }');
+      assert.equal(migrateUserConfig(paths), false);
+      assert.equal(existsSync(paths.legacyUserFile as string), true, '旧文件保持原样');
+      assert.equal(readUserConfig(paths)?.physics !== undefined, true, '生效的仍是新文件');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('旧文件不存在 → 什么都不做（首次使用）', () => {
+    const { paths, dir } = pathsWithUser(null);
+    try {
+      assert.equal(migrateUserConfig(paths), false);
+      assert.equal(existsSync(paths.userFile), false, '不凭空造文件');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('未迁移（迁移失败/未跑）时读取回落旧路径：配置照样生效', () => {
+    const { paths, dir } = legacyOnly('{ "physics": ' + JSON.stringify(BASE.physics) + ' }\n');
+    try {
+      assert.equal(readUserConfig(paths)?.physics !== undefined, true, '读回落旧 .json');
+      assert.equal(userConfigUnparsable(paths), false, '旧路径合法 → 不是损坏');
+      assert.deepEqual(readAllConfig(paths).main.physics, BASE.physics);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('userConfigUnparsable —— 保存前的损坏预检（损坏时必须弹窗，不许静默丢配置）', () => {
+  test('真损坏（语法错误）→ true：宿主据此回 409，不写盘', () => {
+    const { paths, dir } = pathsWithUser('{ "physics": { 这不是 JSON');
+    try {
+      assert.equal(userConfigUnparsable(paths), true);
+      assert.equal(readUserConfig(paths), undefined, '前置：损坏时确实读不出既有字段（白名单重建会丢内容）');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('带注释但合法（同步写入的原文）→ false：不是损坏，正常保存', () => {
+    const { paths, dir } = pathsWithUser('// 注释\n{\n  "physics": ' + JSON.stringify(BASE.physics) + '\n}\n');
+    try {
+      assert.equal(userConfigUnparsable(paths), false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('文件不存在 → false：首次保存没有东西可丢，不打扰用户', () => {
+    const { paths, dir } = pathsWithUser(null);
+    try {
+      assert.equal(userConfigUnparsable(paths), false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('readUserConfig —— 用户层读取必须容忍 JSONC 注释（保存丢字段的回归）', () => {
+  test('「同步」写入的带注释原文：readUserConfig 解析得出（严格 JSON.parse 会 undefined）', () => {
+    const { paths, dir } = pathsWithUser(
+      '// 顶部注释\n{\n  /* 块注释 */\n  "physics": ' + JSON.stringify(BASE.physics) + '\n}\n',
+    );
+    try {
+      assert.throws(() => JSON.parse(readFileSync(paths.userFile, 'utf8')), '前置：严格 JSON.parse 确实读不了');
+      const existing = readUserConfig(paths);
+      assert.ok(existing, '带注释的用户层必须能被 readUserConfig 解析');
+      assert.deepEqual(existing.physics, BASE.physics);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('带注释的用户层 + 保存：高级字段（animations/physics/memes）全部保留', () => {
+    const { paths, dir } = pathsWithUser(
+      '// 用户手改的配置\n{\n' +
+        '  "animations": ' +
+        JSON.stringify(BASE.animations) +
+        ',\n  "physics": ' +
+        JSON.stringify(BASE.physics) +
+        ',\n  "memes": { "可爱": "我改过的描述" }\n}\n',
+    );
+    try {
+      const out = saveUserConfig({ pets: PETS, notificationsEnabled: true }, readUserConfig(paths)) as Record<
+        string,
+        unknown
+      >;
+      assert.deepEqual(out.animations, BASE.animations, 'animations 不得在保存时丢失');
+      assert.deepEqual(out.physics, BASE.physics, 'physics 不得在保存时丢失');
+      assert.deepEqual(out.memes, { 可爱: '我改过的描述' }, '手写的 memes 不得在保存时丢失');
+      assert.equal(out.notificationsEnabled, true, '白名单字段仍以请求体为准');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('用户层不存在 / 损坏 → undefined（按无既有字段处理，不阻塞保存）', () => {
+    const missing = pathsWithUser(null);
+    try {
+      assert.equal(readUserConfig(missing.paths), undefined);
+    } finally {
+      rmSync(missing.dir, { recursive: true, force: true });
+    }
+    const broken = pathsWithUser('{ 这不是 JSON');
+    try {
+      assert.equal(readUserConfig(broken.paths), undefined);
+    } finally {
+      rmSync(broken.dir, { recursive: true, force: true });
+    }
+  });
+});
+
+const PETS = BASE.pets;
+
+describe('saveUserConfig —— 表情包配图开关（白名单 + 透传保留）', () => {
+  test('两个配图开关随请求体写入', () => {
+    const out = saveOnce({ pets: PETS, whisperImageEnabled: true, chatImageEnabled: true });
+    assert.equal(out?.whisperImageEnabled, true);
+    assert.equal(out?.chatImageEnabled, true);
+  });
+
+  test('未传开关时不写入（不凭空造字段）', () => {
+    const out = saveOnce({ pets: PETS });
+    assert.equal('whisperImageEnabled' in (out ?? {}), false);
+    assert.equal('chatImageEnabled' in (out ?? {}), false);
+  });
+
+  test('开关传非布尔 → 整体拒绝（宿主回 400）', () => {
+    assert.equal(saveOnce({ pets: PETS, whisperImageEnabled: 'yes' }), null);
+    assert.equal(saveOnce({ pets: PETS, chatImageEnabled: 1 }), null);
+  });
+
+  test('手写的 memes 映射表被透传保留（设置页保存不抹掉）', () => {
+    const memes = { 可爱: '我改过的描述' };
+    const out = saveOnce({ pets: PETS, whisperImageEnabled: false }, { pets: PETS, memes });
+    assert.deepEqual(out?.memes, memes);
+  });
+
+  test('请求体的开关值覆盖磁盘旧值（不被 existing 反向覆盖）', () => {
+    const out = saveOnce(
+      { pets: PETS, whisperImageEnabled: true },
+      { pets: PETS, whisperImageEnabled: false, chatImageEnabled: true },
+    );
+    assert.equal(out?.whisperImageEnabled, true); // 请求体优先
+    assert.equal(out?.chatImageEnabled, true); // 未传的旧值仍透传保留
+  });
+});
+
+describe('readAllConfig —— 表情包开关合并（缺失取默认 / 非法回退默认）', () => {
+  test('内置默认有值 → 用户层没写时读得到', () => {
+    const merged = readAllConfig(withBase({ whisperImageEnabled: true, chatImageEnabled: false }));
+    assert.equal(merged.main.whisperImageEnabled, true);
+    assert.equal(merged.main.chatImageEnabled, false);
+  });
+
+  test('用户层写了非法值 → 回退内置默认', () => {
+    const merged = readAllConfig(
+      withBase({ whisperImageEnabled: true, chatImageEnabled: false }, { whisperImageEnabled: 'yes' }),
+    );
+    assert.equal(merged.main.whisperImageEnabled, true); // 回退默认 true
+  });
+});
+
+describe('saveUserConfig —— 抛掷锁定开关（白名单 + 透传保留）', () => {
+  test('随请求体写入', () => {
+    const out = saveOnce({ pets: PETS, confineToScreen: true });
+    assert.equal(out?.confineToScreen, true);
+  });
+
+  test('未传时不写入（不凭空造字段）', () => {
+    const out = saveOnce({ pets: PETS });
+    assert.equal('confineToScreen' in (out ?? {}), false);
+  });
+
+  test('传非布尔 → 整体拒绝（宿主回 400）', () => {
+    assert.equal(saveOnce({ pets: PETS, confineToScreen: 'yes' }), null);
+  });
+
+  test('请求体的值覆盖磁盘旧值；未传时透传磁盘旧值', () => {
+    const overwritten = saveOnce({ pets: PETS, confineToScreen: true }, { pets: PETS, confineToScreen: false });
+    assert.equal(overwritten?.confineToScreen, true); // 请求体优先
+    const kept = saveOnce({ pets: PETS }, { pets: PETS, confineToScreen: true });
+    assert.equal(kept?.confineToScreen, true); // 未传的旧值仍透传保留
+  });
+});
+
+describe('saveUserConfig —— 物理参数 physics（白名单 + 透传保留）', () => {
+  const PHYS: Record<string, unknown> = BASE.physics;
+
+  test('整段随请求体写入（设置页「物理」区）', () => {
+    const out = saveOnce({ pets: PETS, physics: PHYS });
+    assert.deepEqual(out?.physics, PHYS, 'physics 必须按请求体整段写入');
+  });
+
+  test('未传时透传磁盘旧值；磁盘上也没有则不凭空造字段', () => {
+    const kept = saveOnce({ pets: PETS }, { pets: PETS, physics: { ...PHYS, gravity: 2000 } });
+    assert.deepEqual(kept?.physics, { ...PHYS, gravity: 2000 }, '未传 physics 时必须原样保留磁盘上的手改值');
+    assert.equal('physics' in (saveOnce({ pets: PETS }) ?? {}), false, '磁盘上也没有时不得凭空写入');
+  });
+
+  test('请求体覆盖磁盘旧值（与四个全局开关同一语义）', () => {
+    const out = saveOnce({ pets: PETS, physics: { ...PHYS, throwPower: 2 } }, { pets: PETS, physics: PHYS });
+    assert.equal((out?.physics as Record<string, unknown>).throwPower, 2);
+  });
+
+  test('非法值 → 整体拒绝（宿主回 400；与读取侧 physicsValid 同一套规则）', () => {
+    const bad: Array<[string, unknown]> = [
+      ['restitution > 1', { ...PHYS, restitution: 1.5 }],
+      ['restitution < 0', { ...PHYS, restitution: -0.1 }],
+      ['gravity 负数', { ...PHYS, gravity: -1 }],
+      ['groundFriction 负数', { ...PHYS, groundFriction: -1 }],
+      ['throwPower = 0', { ...PHYS, throwPower: 0 }],
+      ['gravity 非数字', { ...PHYS, gravity: 'fast' }],
+      [
+        '缺 ceilingBounce',
+        { gravity: 1400, restitution: 0.78, groundFriction: 2.5, throwPower: 1, petCollision: false },
+      ],
+      ['ceilingBounce 非布尔', { ...PHYS, ceilingBounce: 1 }],
+      ['physics 非对象', 'yes'],
+    ];
+    for (const [name, value] of bad) {
+      assert.equal(saveOnce({ pets: PETS, physics: value }), null, `${name} 必须被拒绝`);
+    }
+  });
+});
+
+describe('readAllConfig —— 抛掷锁定合并（缺失取默认 / 非法回退默认）', () => {
+  test('内置默认有值 → 用户层没写时读得到', () => {
+    const merged = readAllConfig(withBase({ confineToScreen: false }));
+    assert.equal(merged.main.confineToScreen, false);
+  });
+
+  test('用户层写了 true → 覆盖内置默认', () => {
+    const merged = readAllConfig(withBase({ confineToScreen: false }, { confineToScreen: true }));
+    assert.equal(merged.main.confineToScreen, true);
+  });
+
+  test('用户层写了非法值 → 回退内置默认', () => {
+    const merged = readAllConfig(withBase({ confineToScreen: true }, { confineToScreen: 'yes' }));
+    assert.equal(merged.main.confineToScreen, true); // 回退默认 true
+  });
+});
+
+describe('saveUserConfig —— 全屏隐藏开关 hideOnFullscreen（白名单 + 透传保留）', () => {
+  test('随请求体写入', () => {
+    assert.equal(saveOnce({ pets: PETS, hideOnFullscreen: true })?.hideOnFullscreen, true);
+  });
+
+  test('未传时不写入（不凭空造字段）', () => {
+    assert.equal('hideOnFullscreen' in (saveOnce({ pets: PETS }) ?? {}), false);
+  });
+
+  test('传非布尔 → 整体拒绝（宿主回 400）', () => {
+    assert.equal(saveOnce({ pets: PETS, hideOnFullscreen: 'yes' }), null);
+    assert.equal(saveOnce({ pets: PETS, hideOnFullscreen: 1 }), null);
+  });
+
+  test('请求体的值覆盖磁盘旧值；未传时透传磁盘旧值', () => {
+    const overwritten = saveOnce({ pets: PETS, hideOnFullscreen: true }, { pets: PETS, hideOnFullscreen: false });
+    assert.equal(overwritten?.hideOnFullscreen, true); // 请求体优先
+    const kept = saveOnce({ pets: PETS }, { pets: PETS, hideOnFullscreen: true });
+    assert.equal(kept?.hideOnFullscreen, true); // 未传的旧值仍透传保留
+  });
+});
+
+describe('readAllConfig —— 全屏隐藏开关合并（缺失取默认 / 非法回退默认）', () => {
+  test('内置默认有值 → 用户层没写时读得到', () => {
+    assert.equal(readAllConfig(withBase({ hideOnFullscreen: false })).main.hideOnFullscreen, false);
+  });
+
+  test('用户层写了 true → 覆盖内置默认', () => {
+    assert.equal(
+      readAllConfig(withBase({ hideOnFullscreen: false }, { hideOnFullscreen: true })).main.hideOnFullscreen,
+      true,
+    );
+  });
+
+  test('用户层写了非法值 → 回退内置默认（并告警一次）', () => {
+    assert.equal(
+      readAllConfig(withBase({ hideOnFullscreen: true }, { hideOnFullscreen: 'yes' })).main.hideOnFullscreen,
+      true,
+    );
+  });
+});
+
+describe('saveUserConfig —— 窥屏吐槽（白名单 + 透传保留）', () => {
+  test('三个人设/开关字段随请求体写入', () => {
+    const out = saveOnce({
+      pets: PETS,
+      peekPrompt: '你是偷看屏幕的小女仆',
+      peekScreenEnabled: true,
+      peekPomodoroEnabled: false,
+    });
+    assert.equal(out?.peekPrompt, '你是偷看屏幕的小女仆');
+    assert.equal(out?.peekScreenEnabled, true);
+    assert.equal(out?.peekPomodoroEnabled, false);
+  });
+
+  test('未传时不写入（不凭空造字段），传了非法值整体拒绝', () => {
+    const out = saveOnce({ pets: PETS });
+    for (const key of ['peekPrompt', 'peekScreenEnabled', 'peekPomodoroEnabled']) {
+      assert.equal(key in (out ?? {}), false, key + ' 不得凭空写入');
+    }
+    assert.equal(saveOnce({ pets: PETS, peekPrompt: '   ' }), null, '空白人设必须被拒（读取侧要求非空字符串）');
+    assert.equal(saveOnce({ pets: PETS, peekPrompt: 42 }), null);
+    assert.equal(saveOnce({ pets: PETS, peekScreenEnabled: 'yes' }), null);
+    assert.equal(saveOnce({ pets: PETS, peekPomodoroEnabled: 1 }), null);
+  });
+
+  test('peekEnabled 是宠物级白名单字段（跟着 pets 一起写）', () => {
+    const out = saveOnce({
+      pets: [
+        { ...PETS[0], peekEnabled: true },
+        { ...PETS[0], id: 'pet-2', peekEnabled: false },
+      ],
+    });
+    const list = out?.pets as Array<Record<string, unknown>>;
+    assert.equal(list[0].peekEnabled, true);
+    assert.equal(list[1].peekEnabled, false);
+    assert.equal(saveOnce({ pets: [{ ...PETS[0], peekEnabled: 'yes' }] }), null, '非布尔必须整体拒绝');
+  });
+
+  test('eventsRefreshSec 整段白名单：每个值都得是正数秒；未传则透传磁盘旧值', () => {
+    const out = saveOnce({ pets: PETS, eventsRefreshSec: { balance: 1800, whisper: 300, peek: 600 } });
+    assert.deepEqual(out?.eventsRefreshSec, { balance: 1800, whisper: 300, peek: 600 });
+    // 未传：保留磁盘上的手改值，不静默抹成默认
+    const kept = saveOnce({ pets: PETS }, { pets: PETS, eventsRefreshSec: { peek: 900 } });
+    assert.deepEqual(kept?.eventsRefreshSec, { peek: 900 });
+    // 非法：非对象 / 空对象 / 非正数 / 非数字
+    for (const bad of ['600', [], {}, { peek: 0 }, { peek: -5 }, { peek: 'soon' }, { peek: null }]) {
+      assert.equal(saveOnce({ pets: PETS, eventsRefreshSec: bad }), null, JSON.stringify(bad) + ' 必须被拒');
+    }
+  });
+
+  test('窥屏字段也走透传保留：请求体没带就不能把磁盘上的用户值抹掉', () => {
+    const disk = { pets: PETS, peekPrompt: '磁盘上的人设', peekScreenEnabled: true, eventsRefreshSec: { peek: 900 } };
+    const out = saveOnce({ pets: PETS }, disk);
+    assert.equal(out?.peekPrompt, '磁盘上的人设');
+    assert.equal(out?.peekScreenEnabled, true);
+    assert.deepEqual(out?.eventsRefreshSec, { peek: 900 });
+  });
+});
+
+describe('readAllConfig —— 窥屏吐槽合并（缺失取默认 / 非法回退默认 / 宠物级开关）', () => {
+  test('内置默认有值 → 用户层没写时读得到（含新增的 peek 周期）', () => {
+    const merged = readAllConfig(
+      withBase({ peekPrompt: '默认人设', peekScreenEnabled: false, peekPomodoroEnabled: true }),
+    );
+    assert.equal(merged.main.peekPrompt, '默认人设');
+    assert.equal(merged.main.peekScreenEnabled, false);
+    assert.equal(merged.main.peekPomodoroEnabled, true);
+  });
+
+  test('用户层写了 → 覆盖内置默认', () => {
+    const merged = readAllConfig(
+      withBase(
+        { peekPrompt: '默认人设', peekScreenEnabled: false, peekPomodoroEnabled: true },
+        { peekPrompt: '用户人设', peekScreenEnabled: true, peekPomodoroEnabled: false },
+      ),
+    );
+    assert.equal(merged.main.peekPrompt, '用户人设');
+    assert.equal(merged.main.peekScreenEnabled, true);
+    assert.equal(merged.main.peekPomodoroEnabled, false);
+  });
+
+  test('用户层写了非法值 → 回退内置默认（不当场炸）', () => {
+    const merged = readAllConfig(
+      withBase({ peekPrompt: '默认人设', peekScreenEnabled: true }, { peekPrompt: '', peekScreenEnabled: 'yes' }),
+    );
+    assert.equal(merged.main.peekPrompt, '默认人设');
+    assert.equal(merged.main.peekScreenEnabled, true);
+  });
+
+  test('eventsRefreshSec.peek 走既有深度合并：用户层只写 peek 也能生效，写非法回退默认', () => {
+    const ok = readAllConfig(withBase({}, { eventsRefreshSec: { peek: 900 } }));
+    assert.equal((ok.main.eventsRefreshSec as Record<string, number>).peek, 900);
+    assert.equal((ok.main.eventsRefreshSec as Record<string, number>).balance, BASE.eventsRefreshSec.balance);
+    const bad = readAllConfig(withBase({ eventsRefreshSec: { peek: 600 } }, { eventsRefreshSec: { peek: -1 } }));
+    assert.equal((bad.main.eventsRefreshSec as Record<string, number>).peek, 600, '非法值回退内置默认');
+  });
+
+  test('pets[].peekEnabled 逐实例合并：缺失取默认（内置 = false），写了 true 生效', () => {
+    // 注意：默认值来自**内置默认配置里的那一条宠物**（不是顶层字段），所以要覆盖 pets 才算换默认
+    const merged = readAllConfig(withBase({}));
+    const pets = merged.main.pets as Array<Record<string, unknown>>;
+    assert.equal(pets[0].peekEnabled, false, '缺失时取内置默认');
+    const withTrueDefault = withBase({ pets: [{ ...BASE.pets[0], peekEnabled: true }] });
+    assert.equal(
+      (readAllConfig(withTrueDefault).main.pets as Array<Record<string, unknown>>)[0].peekEnabled,
+      true,
+      '内置默认写 true 时成品也是 true',
+    );
+    const overridden = readAllConfig(withBase({}, { pets: [{ ...BASE.pets[0], peekEnabled: true }] }));
+    assert.equal((overridden.main.pets as Array<Record<string, unknown>>)[0].peekEnabled, true);
+    const illegal = readAllConfig(
+      withBase({ pets: [{ ...BASE.pets[0], peekEnabled: true }] }, { pets: [{ ...BASE.pets[0], peekEnabled: 'yes' }] }),
+    );
+    assert.equal(
+      (illegal.main.pets as Array<Record<string, unknown>>)[0].peekEnabled,
+      true,
+      '非法值回退内置默认（并告警一次）',
+    );
+  });
+});
+
+describe('syncUserConfigFromDefault —— 同步（内置默认原文写入用户层）', () => {
+  /** 默认文件写入给定原文；用户文件故意放在**尚不存在**的子目录里（验证父目录自建） */
+  function fixture(raw: string): { paths: ConfigPaths; dir: string } {
+    const dir = mkdtempSync(join(tmpdir(), 'dsh-pet-desktop-sync-test-'));
+    const paths: ConfigPaths = {
+      defaultFile: join(dir, 'default.jsonc'),
+      userFile: join(dir, 'dsh-pet-desktop', 'main-config.jsonc'),
+      petDir: join(dir, 'pet'),
+    };
+    writeFileSync(paths.defaultFile, raw);
+    return { paths, dir };
+  }
+
+  test('逐字节复制默认文件原文（注释一并保留）', () => {
+    const raw = '// 顶部注释\n{\n  "pets": []\n}\n';
+    const { paths, dir } = fixture(raw);
+    try {
+      syncUserConfigFromDefault(paths);
+      assert.equal(readFileSync(paths.userFile, 'utf8'), raw, '用户层必须是默认文件的原文（含注释）');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('用户目录不存在 → 自动创建（首次同步即可落盘）', () => {
+    const { paths, dir } = fixture(JSON.stringify(BASE, null, 2));
+    try {
+      assert.equal(existsSync(dirname(paths.userFile)), false, '前置：用户目录本不存在');
+      syncUserConfigFromDefault(paths);
+      assert.equal(existsSync(paths.userFile), true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('同步后的成品 = 没有用户层（与「删除用户配置」等价）', () => {
+    const { paths, dir } = fixture(JSON.stringify(BASE, null, 2));
+    try {
+      const before = readAllConfig(paths); // 无用户层：纯内置默认
+      syncUserConfigFromDefault(paths);
+      // deepStrictEqual：值/结构必须完全一致。**不看键顺序**——用户层会走 mergePets 重建实例，
+      // 键序被规范化为 id 在前（纯外观差异；已用生产 assets/config.jsonc 实测确认值完全一致）。
+      assert.deepStrictEqual(readAllConfig(paths), before);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('默认文件缺失 → 抛错，且不得留下半个用户层文件（宿主回 500）', () => {
+    const { paths, dir } = fixture('{}');
+    try {
+      rmSync(paths.defaultFile, { force: true });
+      assert.throws(() => syncUserConfigFromDefault(paths));
+      assert.equal(existsSync(paths.userFile), false, '失败时不得写出用户层文件');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

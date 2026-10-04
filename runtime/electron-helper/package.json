@@ -1,0 +1,7 @@
+{
+    "name":  "dsh-pet-desktop-electron-helper",
+    "version":  "0.1.0",
+    "private":  true,
+    "description":  "dsh-pet-desktop Electron transparent overlay helper",
+    "main":  "main.js"
+}
