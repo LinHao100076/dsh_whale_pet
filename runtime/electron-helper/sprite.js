@@ -91,6 +91,7 @@ class PetSprite {
     this.menuClose = null; // 当前菜单的 close()（打开时挂载，关闭后置空）
     this.panelOpen = false; // 配置弹窗期间整窗扩大为可交互面板
     this.productivityPanelClose = null;
+    this.todoPanelClose = null; // 「待办日历」面板的 close（三种面板共用同一个"面板槽位"）
     // 悬挂（有应用全屏时主进程把本窗口藏了）：停漫游/停抛掷/暂停视频解码（隐藏窗口不该继续烧 CPU），
     // 并挡住事件动画把播放重新拉起来。窗口放出来时由 setSuspended(false) 恢复随机链。
     this.suspended = false;
@@ -261,6 +262,10 @@ class PetSprite {
     if (this.productivityPanelClose) {
       this.productivityPanelClose();
       this.productivityPanelClose = null;
+    }
+    if (this.todoPanelClose) {
+      this.todoPanelClose();
+      this.todoPanelClose = null;
     }
     this.closeMenu();
     this.stopThrow();
@@ -1141,22 +1146,33 @@ class PetSprite {
   onMenuAction(leaf) {
     this.closeMenu();
     if (!leaf || typeof leaf !== 'object') return;
-    if (leaf.action === 'open-config' || leaf.action === 'open-productivity') {
+    if (leaf.action === 'open-config' || leaf.action === 'open-productivity' || leaf.action === 'open-todo') {
+      // 同一时刻只允许一个面板占着窗口（窗口会被临时扩成居中大窗），开新的先关旧的
       if (this.productivityPanelClose) this.productivityPanelClose();
+      if (this.todoPanelClose) this.todoPanelClose();
+      const onOpenChange = (open) => {
+        this.panelOpen = open;
+        window.__dshPetDebug.productivityPanelOpen = open;
+        this.syncInputBusy();
+        this.setInteractive(open || this.chatOpen || this.menuOpen);
+        if (window.petBridge && window.petBridge.setPanelOpen) window.petBridge.setPanelOpen(open);
+        if (!open) {
+          this.productivityPanelClose = null;
+          this.todoPanelClose = null;
+        }
+      };
+      if (leaf.action === 'open-todo') {
+        if (S.mountTodoPanel) {
+          const panel = S.mountTodoPanel(BASE + '/todo', { onOpenChange });
+          this.todoPanelClose = panel.close;
+        }
+        return;
+      }
       if (S.mountProductivityPanel) {
         const panel = S.mountProductivityPanel(
           BASE + '/productivity',
           leaf.action === 'open-config' ? 'config' : 'productivity',
-          {
-            onOpenChange: (open) => {
-              this.panelOpen = open;
-              window.__dshPetDebug.productivityPanelOpen = open;
-              this.syncInputBusy();
-              this.setInteractive(open || this.chatOpen || this.menuOpen);
-              if (window.petBridge && window.petBridge.setPanelOpen) window.petBridge.setPanelOpen(open);
-              if (!open) this.productivityPanelClose = null;
-            },
-          },
+          { onOpenChange },
         );
         this.productivityPanelClose = panel.close;
       }

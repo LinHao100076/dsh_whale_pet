@@ -1,6 +1,14 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createTodo, deleteTodo, recordCompletedFocus, reorderTodos, setTodoCompleted, updateTodo } from './todo';
+import {
+  createTodo,
+  deleteTodo,
+  recordCompletedFocus,
+  reorderTodos,
+  rescheduleTodo,
+  setTodoCompleted,
+  updateTodo,
+} from './todo';
 
 describe('Todo domain operations', () => {
   test('creates a normalized task with stable timestamps and defaults', () => {
@@ -16,8 +24,41 @@ describe('Todo domain operations', () => {
         order: 0,
         createdAt: 100,
         updatedAt: 100,
+        // 「待办日历」新增：不排期就是 null（显式字段，不用 undefined 表示"没设"）
+        dueDate: null,
+        scheduledDate: null,
+        completedAt: null,
       },
     ]);
+  });
+
+  test('createTodo 支持初始日期；非法日期抛错', () => {
+    const withDates = createTodo([], { id: 'd', title: 'x', dueDate: '2026-10-05', scheduledDate: '2026-10-04' }, 0);
+    assert.equal(withDates[0].dueDate, '2026-10-05');
+    assert.equal(withDates[0].scheduledDate, '2026-10-04');
+    assert.throws(() => createTodo([], { id: 'e', title: 'x', dueDate: '2026-02-30' }, 0), /dueDate/);
+    assert.throws(() => createTodo([], { id: 'f', title: 'x', scheduledDate: 'tomorrow' }, 0), /scheduledDate/);
+  });
+
+  test('完成时记 completedAt，取消完成时清掉', () => {
+    const items = createTodo([], { id: 'x', title: 'Task' }, 1);
+    const done = setTodoCompleted(items, 'x', true, 500);
+    assert.equal(done[0].completed, true);
+    assert.equal(done[0].completedAt, 500);
+    const undone = setTodoCompleted(done, 'x', false, 900);
+    assert.equal(undone[0].completed, false);
+    assert.equal(undone[0].completedAt, null);
+  });
+
+  test('改期只动给定字段（拖拽到某天 / 清空某个日期）', () => {
+    const items = createTodo([], { id: 'x', title: 'Task', dueDate: '2026-10-05' }, 1);
+    const scheduled = rescheduleTodo(items, 'x', { scheduledDate: '2026-10-06' }, 2);
+    assert.equal(scheduled[0].scheduledDate, '2026-10-06');
+    assert.equal(scheduled[0].dueDate, '2026-10-05', '没给的字段不得被动');
+    const cleared = rescheduleTodo(scheduled, 'x', { dueDate: null }, 3);
+    assert.equal(cleared[0].dueDate, null);
+    assert.equal(cleared[0].scheduledDate, '2026-10-06');
+    assert.throws(() => rescheduleTodo(items, 'x', { dueDate: '2026-99-99' }, 4), /dueDate/);
   });
 
   test('rejects blank titles and invalid estimates', () => {
@@ -48,8 +89,17 @@ describe('Todo domain operations', () => {
     let items = createTodo([], { id: 'a', title: 'A' }, 1);
     items = createTodo(items, { id: 'b', title: 'B' }, 2);
     items = reorderTodos(items, ['b', 'a'], 3);
-    assert.deepEqual(items.map((item) => [item.id, item.order]), [['b', 0], ['a', 1]]);
+    assert.deepEqual(
+      items.map((item) => [item.id, item.order]),
+      [
+        ['b', 0],
+        ['a', 1],
+      ],
+    );
     assert.throws(() => reorderTodos(items, ['a', 'a'], 4), /ids/i);
-    assert.deepEqual(deleteTodo(items, 'b').map((item) => item.id), ['a']);
+    assert.deepEqual(
+      deleteTodo(items, 'b').map((item) => item.id),
+      ['a'],
+    );
   });
 });

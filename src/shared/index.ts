@@ -26,3 +26,5 @@ export * from './work-status'; // 工作状态联动（DSH 会话事件 → 档�
 
 export * from './productivity';
 export * from './productivity-panel';
+export * from './calendar'; // 日历纯逻辑（月历网格/周号/日期键/待办分组）
+export * from './todo-panel'; // 待办日历面板（气泡样式，两端共用同一份 DOM）

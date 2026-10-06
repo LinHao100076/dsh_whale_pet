@@ -78,7 +78,8 @@
   "dependencies": {
     "@electron-internal/extract-zip": "^1.0.5",
     "@electron/get": "^5.1.0",
-    "koffi": "^3.3.2"
+    "koffi": "^3.3.2",
+    "lunar-javascript": "^1.7.7"
   },
   "dsh": {
     "bundle": {

@@ -40,6 +40,7 @@ import {
 import { mountChatDialog } from '../shared/chat';
 import { petBridge } from './settings';
 import { mountProductivityPanel } from '../shared/productivity-panel';
+import { mountTodoPanel } from '../shared/todo-panel';
 import { productivityBubbleText, type ProductivitySnapshot } from '../shared/productivity';
 // 「需要你做决定」提醒音：轮询节奏 + 认领判定 + 音量/地址解析（与桌面端同一份纯逻辑）
 import { clampSfxVolume, sfxAssetUrl, sfxCueAction, sfxPollDelayMs, type SfxState } from '../shared/sfx';
@@ -1342,6 +1343,11 @@ export function makePetUI(rt: {
           '/dsh-pet-desktop-7340/productivity',
           leaf.action === 'open-config' ? 'config' : 'productivity',
         );
+        return;
+      }
+      if (leaf.action === 'open-todo') {
+        // 待办日历：独立存储（todos.json）与独立面板，与番茄钟面板互不依赖
+        mountTodoPanel('/dsh-pet-desktop-7340/todo');
         return;
       }
       if (leaf.action === 'whisper') {

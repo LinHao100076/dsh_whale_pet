@@ -86,7 +86,26 @@ import {
 } from './work-status';
 import { agentErrorFrame, reduceNotifyFrame, type HostNotifyFrame } from './notify-events';
 import { profileNameFrom, storageEntries } from './storage-paths';
-import { mutateProductivitySnapshot, reconcileProductivitySnapshot } from './productivity-store';
+import {
+  focusCompletions,
+  mutateProductivitySnapshotWithBefore,
+  readProductivitySnapshot,
+  reconcileProductivitySnapshot,
+  reconcileProductivitySnapshotWithBefore,
+  type ProductivityMutation,
+  type ProductivitySnapshot,
+} from './productivity-store';
+import type { LinkedTodo, ProductivityView } from '../shared/productivity';
+import {
+  configureTodoStore,
+  ensureTodoStore,
+  loadTodos,
+  mutateTodos,
+  recordTodoFocus,
+  type TodoAction,
+} from './todo-store';
+import { buildMonthDays } from './todo-calendar';
+import { isMonthKey, todayKey } from '../shared/calendar';
 import { CueStore, DEFAULT_SFX_FILE, isSoundFileName, resolveSoundFile, sfxState, soundMime } from './sfx';
 import {
   HelperProcess,
@@ -445,21 +464,23 @@ export function apply(ctx: any): void {
   };
 
   /** 读番茄钟情报（窥屏用）：直接读 productivity 存储，与「番茄钟与 Todo」面板同一个事实来源。
-   *  读取失败 / 存储还没建立 → null：窥屏退回"只看窗口"，绝不因为番茄钟读不到而整次失败。 */
+   *  关联任务标题来自**待办存储**（两者已解耦）；读取失败 / 存储还没建立 → null：
+   *  窥屏退回"只看窗口"，绝不因为番茄钟读不到而整次失败。 */
   const readPomodoroIntel = async (): Promise<PeekPomodoro | null> => {
     try {
-      const snap = await reconcileProductivitySnapshot(userRoot);
-      const st = snap.pomodoro.state;
-      const todo = st.todoId ? snap.todos.find((t) => t.id === st.todoId) : undefined;
+      const { before, after } = await reconcileProductivitySnapshotWithBefore(userRoot);
+      await syncPomodoroFocus({ before, after }); // 读情报时也可能跨过周期，一样要记给待办
+      const st = after.pomodoro.state;
       const remaining =
         st.running && st.endsAt !== null
           ? Math.max(0, Math.ceil((st.endsAt - Date.now()) / 1000))
           : st.remainingSeconds;
+      const linked = await linkedTodoView(st.todoId);
       return {
         phase: st.phase,
         running: st.running,
         remainingSeconds: remaining,
-        ...(todo ? { taskTitle: todo.title } : {}),
+        ...(linked ? { taskTitle: linked.title } : {}),
         completedFocusCycles: st.completedFocusCycles,
       };
     } catch {
@@ -723,11 +744,59 @@ export function apply(ctx: any): void {
     });
   };
 
+  // ---- 「待办日历」独立存储的接线 ----
+  // 读老快照**只用于一次性迁移**：迁移完成后待办与番茄钟各自演化，两者之间只剩 state.todoId 这个引用。
+  // 迁移在启动时就跑一次（日志里能看到"迁移了 N 条"），而不是等用户第一次点开面板。
+  configureTodoStore({
+    warn: (message) => ctx.logger?.warn?.('[dsh-pet-desktop] ' + message),
+    readLegacy: () => readProductivitySnapshot(userRoot),
+  });
+  void ensureTodoStore(userRoot).catch((e) =>
+    ctx.logger?.warn?.(`[dsh-pet-desktop] 待办迁移失败：${e instanceof Error ? e.message : String(e)}`),
+  );
+
+  // ---- 番茄钟 ↔ 待办 的唯一连接点 ----
+  // 番茄钟存储里只留 state.todoId 这个引用；"跑完一个专注周期 → 给关联任务记一次"
+  // 由这里完成：对比动作前后的快照，跨过几个周期就记几次（长时间挂起后 reconcile 可能一次跨过多个）。
+  const syncPomodoroFocus = async (mutation: ProductivityMutation): Promise<void> => {
+    const { todoId, count } = focusCompletions(mutation.before, mutation.after);
+    if (!todoId || count <= 0) return;
+    try {
+      for (let i = 0; i < count; i += 1) await recordTodoFocus(userRoot, todoId);
+    } catch (e) {
+      // 记不上不能影响计时本身：只告警（待办文件坏了也不该让番茄钟停摆）
+      ctx.logger?.warn?.(`[dsh-pet-desktop] 番茄数记入待办失败：${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
+  /** 关联任务的展示信息（从待办存储查；查不到返回 null → 页面/气泡当作"没有关联任务"） */
+  const linkedTodoView = async (todoId: string | null): Promise<LinkedTodo | null> => {
+    if (!todoId) return null;
+    try {
+      const doc = await loadTodos(userRoot);
+      const todo = doc.todos.find((t) => t.id === todoId);
+      if (!todo) return null;
+      return {
+        id: todo.id,
+        title: todo.title,
+        completedPomodoros: todo.completedPomodoros,
+        estimatedPomodoros: todo.estimatedPomodoros,
+      };
+    } catch {
+      return null;
+    }
+  };
+
+  /** 给 /productivity 的响应补上 linkedTodo：客户端因此**不需要**再多发一次请求就能显示任务标题 */
+  const withLinkedTodo = async (snap: ProductivitySnapshot): Promise<ProductivityView> => {
+    const linked = await linkedTodoView(snap.pomodoro.state.todoId);
+    return { ...snap, linkedTodo: linked };
+  };
+
   let helper: HelperProcess | undefined;
   let startRetryTimer: NodeJS.Timeout | undefined;
   let electronEnsure: Promise<void> | undefined;
-  let disposed = false;
-  /** 「无图形环境」提示只在进程生命周期内打一次，避免守护循环刷屏 */
+  let disposed = false; /** 「无图形环境」提示只在进程生命周期内打一次，避免守护循环刷屏 */
   let displayWarned = false;
 
   /** 用已确认存在的 Electron 路径拉起桌面 Helper（每只桌面宠物一个局部小窗口）。 */
@@ -996,13 +1065,15 @@ export function apply(ctx: any): void {
       };
     }
 
-    // 番茄钟/Todo 状态（宿主串行执行所有动作；浏览器与桌面窗口共享同一权威快照）
+    // 番茄钟状态（宿主串行执行所有动作；浏览器与桌面窗口共享同一权威快照）
+    // 待办已独立：这里的 todos 只是遗留字段，关联任务标题作为 linkedTodo 一并给出（客户端零额外请求）
     if (rest === 'productivity') {
       if (method === 'GET') {
         try {
-          const snapshot = await reconcileProductivitySnapshot(userRoot);
-          scheduleProductivityDeadline(snapshot);
-          return { kind: 'json', status: 200, obj: snapshot };
+          const { before, after } = await reconcileProductivitySnapshotWithBefore(userRoot);
+          await syncPomodoroFocus({ before, after });
+          scheduleProductivityDeadline(after);
+          return { kind: 'json', status: 200, obj: await withLinkedTodo(after) };
         } catch (e) {
           return { kind: 'json', status: 500, obj: { error: e instanceof Error ? e.message : String(e) } };
         }
@@ -1014,9 +1085,10 @@ export function apply(ctx: any): void {
       if (method !== 'POST') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
       try {
         const action = JSON.parse(body ?? '');
-        const snapshot = await mutateProductivitySnapshot(userRoot, action, Date.now());
-        scheduleProductivityDeadline(snapshot);
-        return { kind: 'json', status: 200, obj: snapshot };
+        const mutation = await mutateProductivitySnapshotWithBefore(userRoot, action, Date.now());
+        await syncPomodoroFocus(mutation);
+        scheduleProductivityDeadline(mutation.after);
+        return { kind: 'json', status: 200, obj: await withLinkedTodo(mutation.after) };
       } catch (e) {
         return { kind: 'json', status: 400, obj: { error: e instanceof Error ? e.message : String(e) } };
       }
@@ -1135,6 +1207,78 @@ export function apply(ctx: any): void {
         return { kind: 'json', status: 200, obj: { ok: false, play: false, error: 'invalid JSON body' } };
       }
       return { kind: 'json', status: 200, obj: { ok: true, play: sfxCues.claim(id) } };
+    }
+
+    // 待办日历（独立存储 todos.json）：
+    //   GET  /todo                  → 整份清单（首次读取会先做一次性迁移）
+    //   POST /todo/action {action}  → 归约一个动作并落盘，返回**新的整份清单**
+    // 与 /productivity 的分工：待办归这里，番茄钟计时归那里；两边只靠 state.todoId 关联。
+    if (rest === 'todo') {
+      if (method !== 'GET') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      try {
+        const doc = await loadTodos(userRoot);
+        return { kind: 'json', status: 200, obj: { ok: true, version: doc.version, todos: doc.todos } };
+      } catch (e) {
+        return {
+          kind: 'json',
+          status: 500,
+          obj: { ok: false, error: e instanceof Error ? e.message : String(e) },
+        };
+      }
+    }
+
+    if (rest === 'todo/action') {
+      if (method !== 'POST') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      let action: TodoAction | null = null;
+      try {
+        const parsed = JSON.parse(body ?? 'null') as unknown;
+        if (parsed && typeof parsed === 'object' && typeof (parsed as { type?: unknown }).type === 'string') {
+          action = parsed as TodoAction;
+        }
+      } catch {
+        return { kind: 'json', status: 400, obj: { ok: false, error: 'invalid JSON body' } };
+      }
+      if (!action) return { kind: 'json', status: 400, obj: { ok: false, error: 'missing action type' } };
+      try {
+        const doc = await mutateTodos(userRoot, action);
+        return { kind: 'json', status: 200, obj: { ok: true, version: doc.version, todos: doc.todos } };
+      } catch (e) {
+        // 校验失败（空标题/非法日期/id 重复…）→ 400，客户端把这句话直接显示给用户
+        return {
+          kind: 'json',
+          status: 400,
+          obj: { ok: false, error: e instanceof Error ? e.message : String(e) },
+        };
+      }
+    }
+
+    // 待办日历的逐日标注（农历/节气/节日 + 休·班调休）：
+    //   GET  /todo/calendar?month=YYYY-MM   → 该月网格每一格的标注
+    //   POST /todo/calendar/refresh?month=  → 强制重取（绕过缓存 TTL，失败也只降级不报错）
+    // 客户端只渲染，不背农历库与网络数据（两端 bundle 都不含这些）。
+    if (rest === 'todo/calendar' || rest === 'todo/calendar/refresh') {
+      const refresh = rest.endsWith('/refresh');
+      if (method !== (refresh ? 'POST' : 'GET')) {
+        return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      }
+      const month = url.searchParams.get('month') ?? todayKey().slice(0, 7);
+      if (!isMonthKey(month)) return { kind: 'json', status: 400, obj: { ok: false, error: 'month 必须是 YYYY-MM' } };
+      try {
+        const days = await buildMonthDays({
+          root: userRoot,
+          month,
+          force: refresh,
+          warn: (message) => ctx.logger?.warn?.('[dsh-pet-desktop] ' + message),
+        });
+        return { kind: 'json', status: 200, obj: { ok: true, month, days } };
+      } catch (e) {
+        // buildMonthDays 内部已全程降级，走到这里说明是意料之外的错误：如实上报，面板照常可用
+        return {
+          kind: 'json',
+          status: 500,
+          obj: { ok: false, error: e instanceof Error ? e.message : String(e) },
+        };
+      }
     }
 
     // 对话：/dsh-pet-desktop-7340/chat?pet=<id>

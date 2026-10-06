@@ -6,5 +6,8 @@
     "outDir": "lib/types",
     "rootDir": "src"
   },
-  "include": ["src/host/index.ts", "src/client/index.ts"]
+  // 注意：include 会**覆盖** tsconfig.json 里的 include，所以环境声明（src/env.d.ts）必须显式列出——
+  // 它不被任何文件 import，不在文件清单里就不会进入程序，`declare module 'lunar-javascript'` 随之为空，
+  // 结果是声明生成报 TS7016（而 `tsc --noEmit` 却是绿的，因为那边的 include 覆盖了整个 src）。
+  "include": ["src/env.d.ts", "src/host/index.ts", "src/client/index.ts"]
 }

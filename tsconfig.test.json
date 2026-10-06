@@ -5,6 +5,7 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["src/**/*.test.ts"],
+  // src/env.d.ts 是环境声明（无人 import），必须显式列出，否则测试里 import('lunar-javascript') 会报 TS7016
+  "include": ["src/env.d.ts", "src/**/*.test.ts"],
   "exclude": []
 }

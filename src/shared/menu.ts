@@ -31,7 +31,8 @@ export interface MenuLeaf {
   anim?: string;
   /** 自定义动作：open-site=打开网站 / show-balance=查看余额；whisper=立即碎碎念一句；
    * chat=打开对话弹窗；home=回到初始位置；reload=重载配置（桌面端专属：重启桌面 Helper，
-   * 全部桌面宠物窗口按最新配置重建——浏览器端刷新页面即可，不注入此项）。
+   * 全部桌面宠物窗口按最新配置重建——浏览器端刷新页面即可，不注入此项）；
+   * open-todo=打开「待办日历」面板（独立存储 todos.json）。
    * 手动触发均不受 whisperEnabled 影响（该字段只关自动周期轮询） */
   action?:
     | 'open-site'
@@ -42,7 +43,8 @@ export interface MenuLeaf {
     | 'home'
     | 'reload'
     | 'open-config'
-    | 'open-productivity';
+    | 'open-productivity'
+    | 'open-todo';
 }
 
 /** 分支：带子菜单的项 */
@@ -100,6 +102,8 @@ export function buildMenuTree(animations: Animations): MenuNode[] {
   return [
     { label: '配置桌宠', action: 'open-config' },
     { label: '番茄钟与 Todo', action: 'open-productivity' },
+    // 「待办日历」：待办已独立存储（todos.json），这里给它一个独立入口
+    { label: '待办日历', action: 'open-todo' },
     { label: '动作', children: groups },
   ];
 }

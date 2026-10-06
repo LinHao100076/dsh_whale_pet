@@ -16,47 +16,25 @@ export function makeProductivitySection({
 }): FunctionComponent {
   return function ProductivitySection() {
     const [snapshot, setSnapshot] = useState(productivityBridge.current);
-    const [title, setTitle] = useState('');
     const [error, setError] = useState('');
     useEffect(() => {
       let alive = true;
       productivityBridge
         .load()
-        .then((value) => { if (alive) setSnapshot(value); })
+        .then((value) => {
+          if (alive) setSnapshot(value);
+        })
         .catch((e) => setError(String(e)));
       const timer = window.setInterval(() => {
         const current = productivityBridge.reconcile();
         if (current && alive) setSnapshot({ ...current });
       }, 1000);
-      return () => { alive = false; window.clearInterval(timer); };
+      return () => {
+        alive = false;
+        window.clearInterval(timer);
+      };
     }, []);
     if (!snapshot) return h('div', { className: 'dsh-settings-section', children: error || '加载中…' });
-    const save = async (next: typeof snapshot) => {
-      try {
-        setSnapshot(await productivityBridge.save(next));
-        setError('');
-      } catch (e) {
-        setError(String(e));
-      }
-    };
-    const add = () => {
-      const value = title.trim();
-      if (!value) return;
-      const now = Date.now();
-      const item = {
-        id: crypto.randomUUID(),
-        title: value,
-        notes: '',
-        completed: false,
-        estimatedPomodoros: 1,
-        completedPomodoros: 0,
-        order: snapshot.todos.length,
-        createdAt: now,
-        updatedAt: now,
-      };
-      void save({ ...snapshot, todos: [...snapshot.todos, item] });
-      setTitle('');
-    };
     const timer = snapshot.pomodoro.state;
     return h('div', {
       className: 'dsh-settings-section',
@@ -70,37 +48,14 @@ export function makeProductivitySection({
           children: timer.running ? '暂停' : '开始',
         }),
         h('button', { onClick: () => productivityBridge.action('reset').then(setSnapshot), children: '重置' }),
-        h('h3', { children: 'Todo' }),
-        h('div', {
-          children: [
-            h('input', {
-              value: title,
-              onInput: (e: any) => setTitle(e.currentTarget.value),
-              placeholder: '新增 Todo',
-            }),
-            h('button', { onClick: add, children: '添加' }),
-          ],
-        }),
-        h('ul', {
-          children: snapshot.todos.map((todo: any) =>
-            h('li', {
-              key: todo.id,
-              children: [
-                h('input', {
-                  type: 'checkbox',
-                  checked: todo.completed,
-                  onChange: (e: any) =>
-                    save({
-                      ...snapshot,
-                      todos: snapshot.todos.map((x: any) =>
-                        x.id === todo.id ? { ...x, completed: e.currentTarget.checked, updatedAt: Date.now() } : x,
-                      ),
-                    }),
-                }),
-                `${todo.title} (${todo.completedPomodoros}/${todo.estimatedPomodoros})`,
-              ],
-            }),
-          ),
+        // 待办清单已独立：这里**不再**提供编辑入口。
+        // 之前它写的是 productivity.json 里的遗留 todos 数组——那份数据现在没人读，
+        // 用户在这里加的任务不会出现在「待办日历」里，属于"看起来能用其实无效"的陷阱，必须去掉。
+        h('h3', { children: '待办清单' }),
+        h('p', {
+          children:
+            '待办已独立为「待办日历」（月历排期 / 截止与计划日期 / 收集箱 / 逾期 / 农历与调休）。' +
+            '桌宠上右键菜单选「待办日历」即可打开；数据存在 ~/.dsh/dsh-pet-desktop/todos.json。',
         }),
         error ? h('p', { children: error }) : null,
       ],

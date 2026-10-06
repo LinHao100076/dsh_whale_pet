@@ -3,7 +3,8 @@ import { DEFAULT_PHYSICS } from './physics';
 import { clampSfxVolume, DEFAULT_SFX_FILE, isSoundFileName } from './sfx';
 import type { PomodoroSettings } from './pomodoro';
 import type { ProductivityAction, ProductivitySnapshot } from './productivity';
-import type { NewTodo, TodoItem, TodoPatch } from './todo';
+// 待办类型只用来展示「关联任务」候选（数据来自 /todo）；新建/编辑待办的动作已经不在这里用
+import type { TodoItem } from './todo';
 import type { PhysicsParams } from './types';
 
 export interface ProductivityPanelOptions {
@@ -272,14 +273,14 @@ export function mountProductivityPanel(
   const mark = node('div', 'dshpd-mark', mode === 'config' ? '🐟' : '🍅');
   mark.setAttribute('aria-hidden', 'true');
   const heading = node('div', 'dshpd-heading');
-  const title = node('h2', 'dshpd-title', mode === 'config' ? '桌宠设置' : '专注与待办');
+  const title = node('h2', 'dshpd-title', mode === 'config' ? '桌宠设置' : '番茄钟');
   title.id = 'dshpd-title';
   const subtitle = node(
     'p',
     'dshpd-subtitle',
     mode === 'config'
       ? '显示与位置 · 互动开关 · 窥屏人设 · 全局配图/通知 · 拖拽抛掷手感'
-      : '把专注时间和手头任务放在一起',
+      : '专注计时 · 关联一条待办（清单在「待办日历」里）',
   );
   heading.append(title, subtitle);
   const closeButton = button('×', 'close');
@@ -840,23 +841,20 @@ async function mountProductivityEditor(content: HTMLElement, status: HTMLElement
   const cycle = node('div', 'dshpd-cycle');
   timer.append(phase, clock, caption, controls, taskPicker, cycle);
 
+  // 「待办清单」已独立成「待办日历」（独立存储 todos.json + 独立面板）。
+  // 番茄钟这里只保留**关联任务**：一个只读下拉，选项来自待办存储（GET /todo），
+  // 不再提供新建/编辑/删除/排序——那些都在待办日历面板里做。
   const todoSection = node('section', 'dshpd-section');
   const todoHead = node('div', 'dshpd-section-head');
-  const todoHeader = node('h3', 'dshpd-section-title', '待办清单');
+  const todoHeader = node('h3', 'dshpd-section-title', '关联任务');
   const todoCount = node('span', 'dshpd-muted');
   todoHead.append(todoHeader, todoCount);
-  const todoForm = node('form', 'dshpd-todo-form');
-  const newTitle = input('text', '');
-  newTitle.placeholder = '添加一件要完成的事';
-  newTitle.maxLength = 160;
-  newTitle.required = true;
-  const newEstimate = input('number', 1, 0, 99);
-  newEstimate.title = '预计番茄数';
-  newEstimate.setAttribute('aria-label', '预计番茄数');
-  const addTodo = button('添加', 'primary');
-  todoForm.append(newTitle, newEstimate, addTodo);
-  const todoList = node('ul', 'dshpd-todos');
-  todoSection.append(todoHead, todoForm, todoList);
+  const todoHint = node(
+    'p',
+    'dshpd-muted',
+    '待办清单已独立为「待办日历」（右键菜单打开）：这里有截止/计划日期、月历与收集箱。番茄钟只引用其中一条任务。',
+  );
+  todoSection.append(todoHead, todoHint);
 
   const settings = node('details', 'dshpd-settings');
   const summary = node('summary', undefined, '番茄钟设置');
@@ -885,7 +883,9 @@ async function mountProductivityEditor(content: HTMLElement, status: HTMLElement
   content.append(timer, todoSection, settings);
 
   let busy = false;
-  let draggedTodoId: string | null = null;
+  /** 关联任务候选：来自**待办存储**（GET /todo），不再是快照里的遗留 todos */
+  let linkedTodos: TodoItem[] = [];
+  const todoEndpoint = `${baseUrl.replace(/\/productivity\/?$/, '')}/todo`;
   const currentRemaining = () => {
     const state = snapshot.pomodoro.state;
     return state.running && state.endsAt !== null
@@ -915,8 +915,9 @@ async function mountProductivityEditor(content: HTMLElement, status: HTMLElement
     const names = { focus: '专注中', shortBreak: '短休息', longBreak: '长休息' };
     phase.textContent = `${state.phase === 'focus' ? '●' : '☕'} ${names[state.phase]}`;
     clock.textContent = formatPomodoroTime(currentRemaining());
+    const linked = state.todoId ? linkedTodos.find((todo) => todo.id === state.todoId) : undefined;
     caption.textContent = state.todoId
-      ? `当前任务：${snapshot.todos.find((todo) => todo.id === state.todoId)?.title ?? '未命名任务'}`
+      ? `当前任务：${linked?.title ?? '（已删除或不在待办日历里）'}`
       : '不关联任务也可以独立计时';
     primary.textContent = state.running
       ? '暂停'
@@ -937,17 +938,29 @@ async function mountProductivityEditor(content: HTMLElement, status: HTMLElement
     const noTask = node('option', undefined, '不关联任务');
     noTask.value = '';
     selectedTodo.append(noTask);
-    for (const todo of snapshot.todos.filter((item) => !item.completed)) {
+    for (const todo of linkedTodos.filter((item) => !item.completed)) {
       const option = node('option', undefined, todo.title);
       option.value = todo.id;
       selectedTodo.append(option);
     }
+    // 当前关联的任务可能已完成/已删除：仍列出来，否则下拉会显示成"不关联任务"（骗人）
+    const current = state.todoId ? linkedTodos.find((item) => item.id === state.todoId) : undefined;
+    if (current && current.completed) {
+      const option = node('option', undefined, `${current.title}（已完成）`);
+      option.value = current.id;
+      selectedTodo.append(option);
+    }
+    if (state.todoId && !current) {
+      const option = node('option', undefined, '已删除的任务');
+      option.value = state.todoId;
+      selectedTodo.append(option);
+    }
     selectedTodo.value = state.todoId ?? '';
     selectedTodo.disabled = busy || state.phase !== 'focus';
-    todoCount.textContent = `${snapshot.todos.filter((todo) => !todo.completed).length} 项未完成`;
-    todoList.replaceChildren();
-    if (!snapshot.todos.length) todoList.append(node('li', 'dshpd-empty', '清单还是空的，先添加一件小事吧。'));
-    for (const todo of snapshot.todos) todoList.append(renderTodo(todo));
+    const openCount = linkedTodos.filter((todo) => !todo.completed).length;
+    todoCount.textContent = linkedTodos.length
+      ? `${openCount} 项未完成 · 共 ${linkedTodos.length} 项`
+      : '待办日历还是空的';
     for (const [control, value] of [
       [focusInput, snapshot.pomodoro.settings.focusMinutes],
       [shortInput, snapshot.pomodoro.settings.shortBreakMinutes],
@@ -985,115 +998,6 @@ async function mountProductivityEditor(content: HTMLElement, status: HTMLElement
     }
   };
 
-  const renderTodo = (todo: TodoItem): HTMLLIElement => {
-    const row = node('li', 'dshpd-todo');
-    row.draggable = !busy;
-    row.dataset.completed = String(todo.completed);
-    row.ondragstart = (event) => {
-      draggedTodoId = todo.id;
-      row.dataset.dragging = 'true';
-      event.dataTransfer?.setData('text/plain', todo.id);
-      if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
-    };
-    row.ondragend = () => {
-      draggedTodoId = null;
-      row.dataset.dragging = 'false';
-      row.dataset.over = 'false';
-    };
-    row.ondragover = (event) => {
-      event.preventDefault();
-      row.dataset.over = 'true';
-    };
-    row.ondragleave = () => {
-      row.dataset.over = 'false';
-    };
-    row.ondrop = (event) => {
-      event.preventDefault();
-      row.dataset.over = 'false';
-      const source = event.dataTransfer?.getData('text/plain') || draggedTodoId;
-      if (!source || source === todo.id) return;
-      const ids = snapshot.todos.map((item) => item.id);
-      const from = ids.indexOf(source);
-      const to = ids.indexOf(todo.id);
-      if (from < 0 || to < 0) return;
-      ids.splice(from, 1);
-      ids.splice(to, 0, source);
-      void runAction({ type: 'todo.reorder', orderedIds: ids }, '排序已保存');
-    };
-
-    const complete = node('input');
-    complete.type = 'checkbox';
-    complete.checked = todo.completed;
-    complete.disabled = busy;
-    complete.setAttribute('aria-label', `标记「${todo.title}」${todo.completed ? '未完成' : '完成'}`);
-    complete.onchange = () =>
-      void runAction({ type: 'todo.complete', todoId: todo.id, completed: complete.checked }, '任务状态已更新');
-    const main = node('div', 'dshpd-todo-main');
-    const taskTitle = node('div', 'dshpd-todo-title', todo.title);
-    const taskMeta = node(
-      'div',
-      'dshpd-todo-meta',
-      `番茄 ${todo.completedPomodoros}/${todo.estimatedPomodoros} · 拖动可排序`,
-    );
-    main.append(taskTitle, taskMeta);
-    const actions = node('div', 'dshpd-todo-actions');
-    const edit = button('编辑', 'icon');
-    edit.onclick = () => beginEdit();
-    const up = button('↑', 'icon');
-    up.title = '上移';
-    up.disabled = busy || snapshot.todos[0]?.id === todo.id;
-    up.onclick = () => moveTodo(todo.id, -1);
-    const down = button('↓', 'icon');
-    down.title = '下移';
-    down.disabled = busy || snapshot.todos[snapshot.todos.length - 1]?.id === todo.id;
-    down.onclick = () => moveTodo(todo.id, 1);
-    const remove = button('删除', 'icon');
-    remove.title = '删除待办';
-    remove.onclick = () => {
-      if (window.confirm(`删除待办「${todo.title}」？`))
-        void runAction({ type: 'todo.delete', todoId: todo.id }, '任务已删除');
-    };
-    actions.append(edit, up, down, remove);
-    row.append(complete, main, actions);
-
-    const beginEdit = () => {
-      const editor = node('div', 'dshpd-todo-edit');
-      const titleInput = input('text', todo.title);
-      titleInput.maxLength = 160;
-      const estimateInput = input('number', todo.estimatedPomodoros, 0, 99);
-      const notesInput = node('textarea', 'dshpd-control') as HTMLTextAreaElement;
-      notesInput.value = todo.notes;
-      notesInput.placeholder = '備注（可选）';
-      const buttons = node('div', 'dshpd-todo-edit-actions');
-      const cancel = button('取消');
-      cancel.onclick = render;
-      const save = button('保存', 'primary');
-      save.onclick = () => {
-        const patch: TodoPatch = {
-          title: titleInput.value,
-          notes: notesInput.value,
-          estimatedPomodoros: Number(estimateInput.value),
-        };
-        void runAction({ type: 'todo.update', todoId: todo.id, patch }, '待办已更新');
-      };
-      buttons.append(cancel, save);
-      editor.append(titleInput, estimateInput, notesInput, buttons);
-      main.replaceChildren(editor);
-      titleInput.focus();
-    };
-
-    return row;
-  };
-
-  const moveTodo = (todoId: string, direction: -1 | 1) => {
-    const ids = snapshot.todos.map((item) => item.id);
-    const index = ids.indexOf(todoId);
-    const next = index + direction;
-    if (index < 0 || next < 0 || next >= ids.length) return;
-    [ids[index], ids[next]] = [ids[next], ids[index]];
-    void runAction({ type: 'todo.reorder', orderedIds: ids }, '排序已保存');
-  };
-
   selectedTodo.onchange = () =>
     void runAction({ type: 'selectTodo', todoId: selectedTodo.value || null }, '专注任务已更新');
   primary.onclick = () =>
@@ -1114,16 +1018,6 @@ async function mountProductivityEditor(content: HTMLElement, status: HTMLElement
     );
   skip.onclick = () => void runAction({ type: 'skip' }, '已切换到下一阶段');
   reset.onclick = () => void runAction({ type: 'reset' }, '计时已重置');
-  todoForm.onsubmit = (event) => {
-    event.preventDefault();
-    const todo: NewTodo = { title: newTitle.value, estimatedPomodoros: Number(newEstimate.value) };
-    void runAction({ type: 'todo.create', todo }, '待办已添加').then((saved) => {
-      if (saved) {
-        newTitle.value = '';
-        newEstimate.value = '1';
-      }
-    });
-  };
   saveSettings.onclick = () => {
     const nextSettings: PomodoroSettings = {
       focusMinutes: Number(focusInput.value),
@@ -1150,6 +1044,17 @@ async function mountProductivityEditor(content: HTMLElement, status: HTMLElement
     }
   };
 
+  /** 关联任务候选来自待办存储（失败就当作"没有待办"：番茄钟仍可独立计时，不阻塞任何操作） */
+  const loadLinkedTodos = async (): Promise<void> => {
+    try {
+      const doc = await requestJson<{ todos?: TodoItem[] }>(todoEndpoint);
+      linkedTodos = Array.isArray(doc.todos) ? doc.todos : [];
+    } catch {
+      linkedTodos = [];
+    }
+    render();
+  };
+
   const poll = async () => {
     if (busy) return;
     try {
@@ -1164,7 +1069,8 @@ async function mountProductivityEditor(content: HTMLElement, status: HTMLElement
     }
   };
   render();
-  setStatus(status, '计时与待办会自动保存在本机，并与桌面及浏览器共享。');
+  void loadLinkedTodos();
+  setStatus(status, '计时保存在本机并与桌面/浏览器共享；待办清单在「待办日历」里。');
   const displayTimer = window.setInterval(() => {
     clock.textContent = formatPomodoroTime(currentRemaining());
   }, 250);
